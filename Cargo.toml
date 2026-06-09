@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/passman-crypto",
+    "crates/passman-totp",
+    "crates/passman-policy",
+    "crates/passman-vault",
+    "crates/passman-hsm",
+    "crates/passman-recovery",
+    "crates/passman-core",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.95"
+publish = false
+
+[workspace.dependencies]
+# Cryptographic primitives (RustCrypto). Versions are conservative starting points;
+# the build step resolves and pins exact versions in Cargo.lock.
+argon2 = "0.5"
+hkdf = "0.12"
+sha2 = "0.10"
+chacha20poly1305 = "0.10"
+hmac = "0.12"
+sha1 = "0.10"
+subtle = "2.5"
+zeroize = { version = "1.7", features = ["derive"] }
+rand = "0.8"
+thiserror = "1.0"
+zxcvbn = "3"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+base32 = "0.5"
+
+# Linux HSM backends (passman-hsm only, behind opt-in features; never in the
+# default build). Pulled in by the crate as `optional = true`.
+#
+# keyring v3 (NOT v4): v4 was rewritten onto keyring-core + external store crates
+# and dropped the synchronous `sync-secret-service` backend and the raw-secret
+# `set_secret`/`get_secret`/`delete_credential` API this code relies on. v3.6.x
+# is the only line that has the blocking, pure-Rust dbus-secret-service backend
+# (no async runtime).
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+# tss-esapi 7 (stable; NOT the 8.0.0-alpha). default-features off — bindings are
+# generated from the system libtss2 headers via tss-esapi-sys/pkg-config.
+tss-esapi = { version = "7", default-features = false }
+
+# Dev/test
+hex-literal = "0.4"
+tempfile = "3"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+
+[profile.release]
+codegen-units = 1

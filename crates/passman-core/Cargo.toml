@@ -1,0 +1,31 @@
+[package]
+name = "passman-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Headless orchestration: unlock/create pipelines, session lifecycle, atomic vault I/O, clipboard, reveal, export/import."
+
+[dependencies]
+passman-crypto = { path = "../passman-crypto" }
+passman-totp = { path = "../passman-totp" }
+passman-vault = { path = "../passman-vault" }
+passman-hsm = { path = "../passman-hsm" }
+passman-policy = { path = "../passman-policy" }
+passman-recovery = { path = "../passman-recovery" }
+postcard.workspace = true
+base32.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+passman-hsm = { path = "../passman-hsm", features = ["mock"] }
+tempfile.workspace = true
+# Test-only: the integration tests generate a valid TOTP code from the seed
+# decoded out of the provisioning URI (passman-totp exposes only verification,
+# not code generation). These reproduce RFC 4226 HOTP-SHA1 in the test harness;
+# both are already workspace-pinned (used by passman-totp). Not a runtime dep.
+hmac.workspace = true
+sha1.workspace = true
+
+[lints]
+workspace = true

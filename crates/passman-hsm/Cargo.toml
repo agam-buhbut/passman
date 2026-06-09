@@ -1,0 +1,43 @@
+[package]
+name = "passman-hsm"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "HardwareKeyStore trait, two-slot wrap-blob format, and a software mock backend. Platform backends live behind feature flags."
+
+[features]
+# Test/dev only: an in-memory software backend that simulates HSM wrap/unwrap.
+# Never enabled in production builds; selection is gated by passman-core.
+mock = []
+# Linux SecretService (D-Bus org.freedesktop.secrets) fallback backend. Pulls in
+# keyring v3 with the synchronous, pure-Rust dbus-secret-service backend.
+secret-service = ["dep:keyring"]
+# Linux TPM 2.0 backend. Pulls in tss-esapi 7 (links against system libtss2;
+# requires libtss2-dev + pkg-config at build time).
+tpm2 = ["dep:tss-esapi"]
+# Android hardware Keystore backend (AES-256-GCM, wire 0x02, §6.4). Pure-Rust
+# orchestration over a foreign KeystoreWrapper (the Kotlin shim) — no FFI deps
+# in this crate. The binding/shim live in passman-uniffi (added separately).
+android-keystore = []
+
+[dependencies]
+passman-crypto = { path = "../passman-crypto" }
+thiserror.workspace = true
+
+# Optional, feature-gated platform backends. With no feature enabled neither is
+# compiled and the default build is byte-for-byte unchanged.
+keyring = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# tss-esapi only exists on Linux; gating the dependency by target keeps a
+# `--features tpm2` build on a non-Linux host from trying to link libtss2.
+tss-esapi = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Test-only. Used by the `tpm2` swtpm harness for a throwaway TPM state dir;
+# never linked into any non-test build. Already a workspace dependency.
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

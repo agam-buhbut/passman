@@ -1,0 +1,17 @@
+[package]
+name = "passman-recovery"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Recovery export/import: password-only Argon2id, zeroizing payload framing. Pure, no I/O."
+
+[dependencies]
+passman-crypto = { path = "../passman-crypto" }
+thiserror.workspace = true
+
+[dev-dependencies]
+hex-literal.workspace = true
+
+[lints]
+workspace = true

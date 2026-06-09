@@ -1,0 +1,20 @@
+[package]
+name = "passman-totp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "RFC 6238 TOTP verification with clock injection and in-memory replay protection."
+
+[dependencies]
+passman-crypto = { path = "../passman-crypto" }
+hmac.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+hex-literal.workspace = true
+
+[lints]
+workspace = true

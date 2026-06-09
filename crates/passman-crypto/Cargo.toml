@@ -1,0 +1,23 @@
+[package]
+name = "passman-crypto"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Cryptographic primitives and zeroizing secret types for passman. No I/O, no platform code."
+
+[dependencies]
+argon2.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+chacha20poly1305.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+hex-literal.workspace = true
+
+[lints]
+workspace = true

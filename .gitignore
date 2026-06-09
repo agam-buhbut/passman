@@ -1,0 +1,41 @@
+# ── Rust ──────────────────────────────────────────────────────────────────
+/target
+**/*.rs.bk
+*.pdb
+# NOTE: Cargo.lock IS committed — passman is an application, not a library
+# (Rust convention: lockfiles are committed for applications).
+
+# ── Android / Gradle (the Kotlin shim lands under android/ in Task 8) ──────
+android/.gradle/
+android/build/
+android/app/build/
+android/captures/
+android/.cxx/
+android/local.properties
+*.iml
+.idea/
+
+# ── Editors ───────────────────────────────────────────────────────────────
+*.swp
+*.swo
+*~
+.vscode/
+
+# ── OS cruft ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Secrets & signing material — NEVER commit (this is a password manager) ──
+# Release/app signing keys and any crypto material. A *legitimate* test fixture
+# with one of these extensions must be force-added (`git add -f <path>`).
+*.jks
+*.keystore
+*.pem
+*.key
+*.p12
+*.pfx
+.env
+.env.*
+
+# ── Local tool output (e.g. a redirected `cargo check` scratch dir) ────────
+cargocheck.*

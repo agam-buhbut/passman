@@ -1,0 +1,17 @@
+[package]
+name = "passman-policy"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Password generation (OsRng), zxcvbn entropy estimation, and per-entry policy types."
+
+[dependencies]
+passman-crypto = { path = "../passman-crypto" }
+rand.workspace = true
+zxcvbn.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
