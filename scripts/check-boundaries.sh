@@ -41,6 +41,9 @@ allowed[passman-core]="passman-crypto passman-totp passman-policy passman-vault 
 # passman-platform is an independent shell-support leaf (paths + settings). It
 # depends on no other passman crate — the binaries compose it with passman-core.
 allowed[passman-platform]=""
+# passman-cli is a top-level binary shell: it composes core with the platform
+# crate and the HSM backend selection, and may depend on any library crate.
+allowed[passman-cli]="passman-crypto passman-totp passman-policy passman-vault passman-hsm passman-recovery passman-core passman-platform"
 
 for dir in crates/*/; do
     name=$(awk -F\" '/^name *=/{print $2; exit}' "$dir/Cargo.toml")

@@ -1,0 +1,54 @@
+[package]
+name = "passman-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Command-line password manager: a thin shell over passman-core (CRUD, generation, recovery) with a TPM2/SecretService backend on Linux."
+
+[[bin]]
+name = "passman"
+path = "src/main.rs"
+
+[lib]
+name = "passman_cli"
+path = "src/lib.rs"
+
+[dependencies]
+passman-core = { path = "../passman-core" }
+passman-platform = { path = "../passman-platform" }
+passman-crypto = { path = "../passman-crypto" }
+passman-policy = { path = "../passman-policy" }
+passman-totp = { path = "../passman-totp" }
+passman-vault = { path = "../passman-vault" }
+passman-recovery = { path = "../passman-recovery" }
+# HSM backend selection + the LinuxKeyStore dispatch enum (TPM2 -> SecretService
+# per §6.2). Linux backends are behind features, enabled here for the binary.
+passman-hsm = { path = "../passman-hsm", features = ["tpm2", "secret-service"] }
+
+clap = { workspace = true }
+anyhow = { workspace = true }
+rpassword = { workspace = true }
+arboard = { workspace = true }
+# SHA-256 for the clipboard cookie digest (§5.3: the platform Clipboard impl
+# computes the digest; core never hashes). Already in the workspace lockfile.
+sha2 = { workspace = true }
+# Scrub the transient clipboard read/write buffers after hashing. Workspace-pinned.
+zeroize = { workspace = true }
+
+[dev-dependencies]
+# Tests drive the generic command logic against the in-memory mock backend.
+passman-hsm = { path = "../passman-hsm", features = ["tpm2", "secret-service", "mock"] }
+# export_unchecked builds a cheap recovery file for the `import` command test.
+passman-recovery = { path = "../passman-recovery", features = ["test-util"] }
+tempfile = { workspace = true }
+# Generate valid RFC 4226 TOTP codes from the seed in the provisioning URI so the
+# tests can unlock (passman-totp exposes only verification). Workspace-pinned.
+hmac = { workspace = true }
+sha1 = { workspace = true }
+base32 = { workspace = true }
+# Encode a valid EntryPolicy into the recovery file the import test builds.
+postcard = { workspace = true }
+
+[lints]
+workspace = true

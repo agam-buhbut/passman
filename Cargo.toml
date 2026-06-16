@@ -9,6 +9,7 @@ members = [
     "crates/passman-recovery",
     "crates/passman-core",
     "crates/passman-platform",
+    "crates/passman-cli",
 ]
 
 [workspace.package]
@@ -40,6 +41,13 @@ base32 = "0.5"
 # widely-used crates; not pulled into the pure security core.
 toml = "0.8"
 directories = "5"
+
+# CLI shell (passman-cli): argument parsing, hidden password prompt, OS
+# clipboard, and binary error handling. Shell-only; never in the security core.
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+rpassword = "7"
+arboard = "3"
 
 # Linux HSM backends (passman-hsm only, behind opt-in features; never in the
 # default build). Pulled in by the crate as `optional = true`.

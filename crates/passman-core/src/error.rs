@@ -153,4 +153,16 @@ impl CoreError {
     pub(crate) fn io(context: &'static str, source: std::io::Error) -> Self {
         CoreError::Io { context, source }
     }
+
+    /// Construct an I/O-flavoured error from a shell-side failure (e.g. a
+    /// [`Clipboard`](crate::Clipboard) backend that could not read or write).
+    ///
+    /// `CoreError` is `#[non_exhaustive]`, so a shell crate cannot build its
+    /// variants directly; this is the supported way for an out-of-crate
+    /// [`Clipboard`](crate::Clipboard) / I/O adapter to surface a failure. The
+    /// `context` must be a fixed, non-secret label.
+    #[must_use]
+    pub fn shell_io(context: &'static str, source: std::io::Error) -> Self {
+        CoreError::Io { context, source }
+    }
 }
