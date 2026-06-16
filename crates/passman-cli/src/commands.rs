@@ -10,7 +10,7 @@ use passman_core::{App, Clipboard, UnlockError, UnlockedApp};
 use passman_crypto::SecretString;
 use passman_hsm::{BiometricPrompter, HardwareKeyStore};
 use passman_platform::{Paths, Settings};
-use passman_policy::{classify, estimate_master, generate, EntryPolicy, GenerationRequest};
+use passman_policy::{classify, estimate_master, EntryPolicy, GenerationRequest};
 use passman_totp::Clock;
 use passman_vault::{EntryId, EntryRecord};
 
@@ -65,7 +65,7 @@ where
 {
     // `gen` needs no vault (and so no single-instance lock); handle it first.
     if let Command::Gen { length } = command {
-        return cmd_gen(length, env);
+        return generate(length, env);
     }
 
     let app = open_app(backend, env)?;
@@ -209,7 +209,14 @@ fn require_vault(path: &Path) -> Result<()> {
 // ----- Commands --------------------------------------------------------------
 
 /// Generate a password without touching the vault (`gen`).
-fn cmd_gen<I: Io, C: Clipboard>(length: Option<u16>, env: &mut CliEnv<I, C>) -> Result<()> {
+///
+/// Public so the binary can run it **without selecting an HSM backend** (a TPM
+/// is irrelevant to generation).
+///
+/// # Errors
+///
+/// [`anyhow::Error`] if the generation request is unsatisfiable.
+pub fn generate<I: Io, C: Clipboard>(length: Option<u16>, env: &mut CliEnv<I, C>) -> Result<()> {
     let req = match length {
         Some(n) => GenerationRequest::new(
             n,
@@ -218,7 +225,7 @@ fn cmd_gen<I: Io, C: Clipboard>(length: Option<u16>, env: &mut CliEnv<I, C>) -> 
         ),
         None => GenerationRequest::default_vault(),
     };
-    let pw = generate(&req).context("password generation failed")?;
+    let pw = passman_policy::generate(&req).context("password generation failed")?;
     env.io.out(pw.expose());
     Ok(())
 }

@@ -16,6 +16,6 @@ mod prompter;
 
 pub use cli::{Cli, Command, Field, Preset, RecPreset};
 pub use clipboard::SystemClipboard;
-pub use commands::{run, CliEnv};
+pub use commands::{generate, run, CliEnv};
 pub use io::{Io, TerminalIo};
 pub use prompter::DesktopPrompter;

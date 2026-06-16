@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use passman_cli::{run, Cli, CliEnv, DesktopPrompter, SystemClipboard, TerminalIo};
+use passman_cli::{run, Cli, CliEnv, Command, DesktopPrompter, SystemClipboard, TerminalIo};
 use passman_platform::{Paths, Settings};
 use passman_totp::{Clock, SystemClock};
 
@@ -43,17 +43,7 @@ fn real_main() -> Result<()> {
     let clipboard = SystemClipboard::new();
     let mut io = TerminalIo;
 
-    // Select the real Linux backend per §6.2 (TPM2 → SecretService).
-    let backend = passman_hsm::linux::select_linux_backend(cli.allow_software_hsm).map_err(|e| {
-        match e {
-            passman_hsm::HsmError::HardwareAbsent => anyhow::anyhow!(
-                "no TPM 2.0 found. Re-run with --allow-software-hsm to use the OS keyring \
-                 instead (weaker: no hardware lockout)."
-            ),
-            other => anyhow::Error::new(other).context("could not select an HSM backend"),
-        }
-    })?;
-
+    let allow_software = cli.allow_software_hsm;
     let mut env = CliEnv {
         clock,
         prompter: &prompter,
@@ -61,12 +51,28 @@ fn real_main() -> Result<()> {
         io: &mut io,
         settings: &settings,
         paths: &paths,
-        allow_software: cli.allow_software_hsm,
+        allow_software,
         clipboard_clear: Duration::from_secs(CLIPBOARD_CLEAR_SECS),
         kdf_override: None,
     };
 
-    run(cli.command, backend, &mut env)
+    // `gen` needs no vault and no HSM — don't open the (possibly unavailable)
+    // TPM just to print a password.
+    match cli.command {
+        Command::Gen { length } => passman_cli::generate(length, &mut env),
+        command => {
+            // Select the real Linux backend per §6.2 (TPM2 → SecretService).
+            let backend =
+                passman_hsm::linux::select_linux_backend(allow_software).map_err(|e| match e {
+                    passman_hsm::HsmError::HardwareAbsent => anyhow::anyhow!(
+                        "no TPM 2.0 found. Re-run with --allow-software-hsm to use the OS \
+                         keyring instead (weaker: no hardware lockout)."
+                    ),
+                    other => anyhow::Error::new(other).context("could not select an HSM backend"),
+                })?;
+            run(command, backend, &mut env)
+        }
+    }
 }
 
 /// Non-Linux builds have no backend yet (Windows/macOS shells are later work).
