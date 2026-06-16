@@ -4,14 +4,32 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 publish = false
-description = "UniFFI binding surface for the Android (Kotlin) front-end over passman-core."
+description = "UniFFI binding surface for the Android (Kotlin/Compose) front-end: a concrete App<AndroidKeyStore> over the foreign KeystoreWrapper and clipboard."
 
 [lib]
 crate-type = ["cdylib", "lib"]
 name = "passman_uniffi"
 
+# The uniffi-bindgen CLI, gated so the `uniffi/cli` deps stay out of the Android
+# cdylib. Run: cargo run -p passman-uniffi --features bindgen --bin uniffi-bindgen
+[[bin]]
+name = "uniffi-bindgen"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli"]
+
 [dependencies]
+passman-core = { path = "../passman-core" }
+passman-crypto = { path = "../passman-crypto" }
+passman-policy = { path = "../passman-policy" }
+passman-totp = { path = "../passman-totp" }
+passman-vault = { path = "../passman-vault" }
+# The Android Keystore host backend + the foreign KeystoreWrapper trait.
+passman-hsm = { path = "../passman-hsm", features = ["android-keystore"] }
+
 uniffi = { workspace = true }
+thiserror = { workspace = true }
 
 [build-dependencies]
 uniffi = { workspace = true, features = ["build"] }

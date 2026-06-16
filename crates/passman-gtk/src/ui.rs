@@ -465,6 +465,15 @@ fn attach_response_poll(ui: &Rc<Ui>, responses: Receiver<Response>) {
 
 fn handle_response(ui: &Rc<Ui>, response: Response) {
     match response {
+        // The desktop app does not create vaults in-app (use the CLI), but the
+        // shared actor can; treat a create like an unlock if it ever arrives.
+        Response::Created { entries, .. } => {
+            ui.set_entries(entries);
+            ui.stack.set_visible_child_name("vault");
+        }
+        Response::CreateFailed { message } => {
+            ui.unlock_error.set_text(&message);
+        }
         Response::Unlocked { entries } => {
             ui.unlock_spinner.set_spinning(false);
             ui.unlock_btn.set_sensitive(true);

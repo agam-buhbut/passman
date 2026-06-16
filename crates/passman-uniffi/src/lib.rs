@@ -1,7 +1,595 @@
-//! UniFFI binding probe.
+//! `passman-uniffi` — the `UniFFI` binding surface for the Android
+//! (Kotlin/Compose) front-end (`architecture.md` §6.5, Android plan Task 7).
+//!
+//! A **pure binding crate**: it exposes a concrete, non-generic
+//! [`PassmanApp`] monomorphized over [`AndroidKeyStore`], plus the foreign
+//! callback interfaces the Kotlin shim implements ([`KeystoreBridge`],
+//! [`ClipboardBridge`]). All orchestration lives in `passman-core` (driven here
+//! through the shared session actor [`passman_core::Session`]); generics and the
+//! associated `PlatformCtx` never cross the FFI boundary.
+//!
+//! The biometric prompt is **not** a foreign callback: an Android per-use-auth
+//! key drives its own `BiometricPrompt` inside the Kotlin `KeystoreBridge.wrap`
+//! / `unwrap` (decision D-A1), so the Rust side passes a no-op prompter.
+
+// Every `#[uniffi::export]` method and foreign-trait method takes **owned**
+// parameters by necessity — UniFFI cannot pass references across the FFI
+// boundary (§6.5) — so `needless_pass_by_value` does not apply. The foreign
+// bridge traits document their errors collectively (each is a foreign failure),
+// so per-method `# Errors` sections add no information here.
+#![allow(clippy::needless_pass_by_value, clippy::missing_errors_doc)]
+
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex, PoisonError};
+
+use passman_core::worker::{Request, Response};
+use passman_core::{App, ClipboardCookie, EntryHandle, RevealField, Session};
+use passman_crypto::{KdfParams, SecretString};
+use passman_hsm::{
+    AndroidKeyStore, BiometricPrompter, HsmError, KeystoreError, KeystoreSecurityLevel,
+    KeystoreWrapper, PromptResult, WrappedParts,
+};
+use passman_totp::{Clock, SystemClock};
+use passman_vault::EntryId;
+
 uniffi::setup_scaffolding!();
 
-#[uniffi::export]
-fn ping() -> String {
-    "pong".to_owned()
+/// GCM IV length (Android `Keystore` AES-GCM, §6.4); the host `WrappedParts.iv`
+/// is `[u8; 12]`.
+const GCM_IV_LEN: usize = 12;
+/// SHA-256 clipboard cookie digest length (§5.3).
+const DIGEST_LEN: usize = 32;
+/// Entry id length (`UUIDv4`, §4.4).
+const ENTRY_ID_LEN: usize = 16;
+
+// ===== Foreign value types (mirrors of the host Android types) ==============
+
+/// Hardware security level backing a `Keystore` key (§6.2).
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum SecurityLevel {
+    /// Discrete secure element (`StrongBox`).
+    StrongBox,
+    /// TEE-backed.
+    TrustedEnvironment,
+    /// Pure software (refused, §6.2).
+    Software,
 }
+
+impl From<SecurityLevel> for KeystoreSecurityLevel {
+    fn from(level: SecurityLevel) -> Self {
+        match level {
+            SecurityLevel::StrongBox => KeystoreSecurityLevel::StrongBox,
+            SecurityLevel::TrustedEnvironment => KeystoreSecurityLevel::TrustedEnvironment,
+            SecurityLevel::Software => KeystoreSecurityLevel::Software,
+        }
+    }
+}
+
+/// Typed, message-free `Keystore` failure categories the Kotlin shim normalizes
+/// Java exceptions / biometric `int` codes into (invariant 5).
+#[derive(Debug, Clone, Copy, uniffi::Error, thiserror::Error)]
+pub enum KeystoreFailure {
+    /// User dismissed the prompt.
+    #[error("cancelled")]
+    Cancelled,
+    /// Biometric lockout (transient; cleared by device-credential re-auth).
+    #[error("lockout")]
+    Lockout,
+    /// The wrapping key was permanently invalidated.
+    #[error("key invalidated")]
+    KeyInvalidated,
+    /// GCM authentication failed (wrong slot AAD or tampered blob).
+    #[error("auth failed")]
+    AuthFailed,
+    /// No secure lock screen / no usable hardware `Keystore`.
+    #[error("no secure lock or hardware")]
+    NoSecureLockOrHardware,
+    /// Any other backend fault.
+    #[error("backend error")]
+    Backend,
+}
+
+impl From<uniffi::UnexpectedUniFFICallbackError> for KeystoreFailure {
+    fn from(_: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        KeystoreFailure::Backend
+    }
+}
+
+impl From<KeystoreFailure> for KeystoreError {
+    fn from(f: KeystoreFailure) -> Self {
+        match f {
+            KeystoreFailure::Cancelled => KeystoreError::Cancelled,
+            KeystoreFailure::Lockout => KeystoreError::Lockout,
+            KeystoreFailure::KeyInvalidated => KeystoreError::KeyInvalidated,
+            KeystoreFailure::AuthFailed => KeystoreError::AuthFailed,
+            KeystoreFailure::NoSecureLockOrHardware => KeystoreError::NoSecureLockOrHardware,
+            KeystoreFailure::Backend => KeystoreError::Backend,
+        }
+    }
+}
+
+/// The outputs of a successful [`KeystoreBridge::wrap`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct WrapOutput {
+    /// The `Keystore`-generated 12-byte GCM IV (`Cipher.getIV()`).
+    pub iv: Vec<u8>,
+    /// The ciphertext with the appended 16-byte GCM tag.
+    pub ciphertext: Vec<u8>,
+    /// The security level of the key that produced this ciphertext.
+    pub level: SecurityLevel,
+}
+
+/// A foreign-callback failure (clipboard bridge).
+#[derive(Debug, Clone, Copy, uniffi::Error, thiserror::Error)]
+pub enum CallbackError {
+    /// The foreign operation failed.
+    #[error("foreign callback failed")]
+    Failed,
+}
+
+impl From<uniffi::UnexpectedUniFFICallbackError> for CallbackError {
+    fn from(_: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        CallbackError::Failed
+    }
+}
+
+// ===== Foreign callback interfaces (implemented by the Kotlin shim) =========
+
+/// The Android `Keystore` mechanics, implemented foreign-side by the Kotlin shim
+/// (Task 8). Mirrors `passman_hsm::KeystoreWrapper`; the [`KeystoreAdapter`]
+/// forwards the host trait to it.
+#[uniffi::export(with_foreign)]
+pub trait KeystoreBridge: Send + Sync {
+    /// Generate a per-use-auth AES-256-GCM key under `alias`, encrypt `material`
+    /// with `AAD = [slot_tag]` (driving the `CryptoObject` prompt), and return
+    /// the IV, ciphertext+tag, and security level. MUST delete `alias` on any
+    /// post-keygen failure (invariant 6).
+    fn wrap(
+        &self,
+        alias: String,
+        slot_tag: u8,
+        material: Vec<u8>,
+    ) -> Result<WrapOutput, KeystoreFailure>;
+
+    /// Decrypt `ciphertext` under `alias` with `AAD = [slot_tag]` and `iv`.
+    fn unwrap(
+        &self,
+        alias: String,
+        slot_tag: u8,
+        iv: Vec<u8>,
+        ciphertext: Vec<u8>,
+    ) -> Result<Vec<u8>, KeystoreFailure>;
+
+    /// Destroy `alias`'s key (idempotent).
+    fn invalidate(&self, alias: String) -> Result<(), KeystoreFailure>;
+
+    /// Probe the device's hardware security posture (refuse-software pre-flight).
+    fn probe(&self) -> Result<SecurityLevel, KeystoreFailure>;
+}
+
+/// The OS clipboard, implemented foreign-side by the Kotlin shim (§5.3). The
+/// foreign impl computes the SHA-256 digest of what it writes (core never
+/// hashes).
+#[uniffi::export(with_foreign)]
+pub trait ClipboardBridge: Send + Sync {
+    /// Place `secret` on the clipboard; return its SHA-256 digest (32 bytes).
+    fn write(&self, secret: String) -> Result<Vec<u8>, CallbackError>;
+
+    /// The SHA-256 digest of the clipboard's current contents, or `None`.
+    fn read_digest(&self) -> Result<Option<Vec<u8>>, CallbackError>;
+
+    /// Overwrite the clipboard with `text` (clear-by-overwrite).
+    fn set_text(&self, text: String) -> Result<(), CallbackError>;
+}
+
+// ===== Adapters: foreign interface -> host trait ============================
+
+/// Adapts a foreign [`KeystoreBridge`] to the host `KeystoreWrapper`.
+struct KeystoreAdapter(Arc<dyn KeystoreBridge>);
+
+impl KeystoreWrapper for KeystoreAdapter {
+    fn wrap(
+        &self,
+        alias: &str,
+        slot_tag: u8,
+        material: &[u8],
+    ) -> Result<WrappedParts, KeystoreError> {
+        let out = self.0.wrap(alias.to_owned(), slot_tag, material.to_vec())?;
+        let iv =
+            <[u8; GCM_IV_LEN]>::try_from(out.iv.as_slice()).map_err(|_| KeystoreError::Backend)?;
+        Ok(WrappedParts {
+            iv,
+            ciphertext: out.ciphertext,
+            level: out.level.into(),
+        })
+    }
+
+    fn unwrap(
+        &self,
+        alias: &str,
+        slot_tag: u8,
+        iv: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, KeystoreError> {
+        Ok(self
+            .0
+            .unwrap(alias.to_owned(), slot_tag, iv.to_vec(), ciphertext.to_vec())?)
+    }
+
+    fn invalidate(&self, alias: &str) -> Result<(), KeystoreError> {
+        Ok(self.0.invalidate(alias.to_owned())?)
+    }
+
+    fn probe(&self) -> Result<KeystoreSecurityLevel, KeystoreError> {
+        Ok(self.0.probe()?.into())
+    }
+}
+
+/// Adapts a foreign [`ClipboardBridge`] to the host `Clipboard`.
+struct ClipboardAdapter(Arc<dyn ClipboardBridge>);
+
+fn fixed_digest(v: Vec<u8>) -> Result<[u8; DIGEST_LEN], passman_core::CoreError> {
+    <[u8; DIGEST_LEN]>::try_from(v.as_slice()).map_err(|_| {
+        passman_core::CoreError::shell_io(
+            "clipboard digest length",
+            std::io::Error::other("digest is not 32 bytes"),
+        )
+    })
+}
+
+fn callback_io(_: CallbackError) -> passman_core::CoreError {
+    passman_core::CoreError::shell_io(
+        "clipboard bridge",
+        std::io::Error::other("foreign clipboard failed"),
+    )
+}
+
+impl passman_core::Clipboard for ClipboardAdapter {
+    fn write(&self, secret: &SecretString) -> Result<ClipboardCookie, passman_core::CoreError> {
+        let digest = self.0.write(secret.expose().to_owned()).map_err(callback_io)?;
+        Ok(ClipboardCookie::new(fixed_digest(digest)?, SystemClock.now()))
+    }
+
+    fn read_digest(&self) -> Result<Option<[u8; DIGEST_LEN]>, passman_core::CoreError> {
+        match self.0.read_digest().map_err(callback_io)? {
+            Some(v) => Ok(Some(fixed_digest(v)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn set_text(&self, text: &str) -> Result<(), passman_core::CoreError> {
+        self.0.set_text(text.to_owned()).map_err(callback_io)
+    }
+}
+
+/// No-op prompter: the Android backend ignores it (the Kotlin shim drives the
+/// `CryptoObject` prompt itself — decision D-A1).
+struct NoopPrompter;
+
+impl BiometricPrompter for NoopPrompter {
+    fn prompt(&self, _reason: String) -> Result<PromptResult, HsmError> {
+        Ok(PromptResult::Authenticated)
+    }
+}
+
+// ===== App-facing types =====================================================
+
+/// Which entry field to reveal/copy.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum FieldKind {
+    /// Username.
+    Username,
+    /// Password.
+    Password,
+    /// URL.
+    Url,
+    /// Notes.
+    Notes,
+}
+
+impl From<FieldKind> for RevealField {
+    fn from(f: FieldKind) -> Self {
+        match f {
+            FieldKind::Username => RevealField::Username,
+            FieldKind::Password => RevealField::Password,
+            FieldKind::Url => RevealField::Url,
+            FieldKind::Notes => RevealField::Notes,
+        }
+    }
+}
+
+/// Argon2id cost preset for vault creation (§4.8).
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum KdfChoice {
+    /// 256 MiB / t=4 (floor).
+    Low,
+    /// 1 GiB / t=4 (default).
+    Medium,
+    /// 4 GiB / t=6.
+    High,
+}
+
+impl KdfChoice {
+    fn params(self) -> KdfParams {
+        match self {
+            KdfChoice::Low => KdfParams::LOW,
+            KdfChoice::Medium => KdfParams::MEDIUM,
+            KdfChoice::High => KdfParams::HIGH,
+        }
+    }
+}
+
+/// A non-secret entry handle (id + label).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct EntryItem {
+    /// The 16-byte entry id.
+    pub id: Vec<u8>,
+    /// The human-readable label.
+    pub label: String,
+}
+
+impl From<EntryHandle> for EntryItem {
+    fn from(h: EntryHandle) -> Self {
+        EntryItem {
+            id: h.id.as_bytes().to_vec(),
+            label: h.label,
+        }
+    }
+}
+
+/// Errors surfaced to the Kotlin side from [`PassmanApp`] methods.
+#[derive(Debug, Clone, uniffi::Error, thiserror::Error)]
+pub enum AppError {
+    /// The vault could not be opened (e.g. already in use, or no hardware).
+    #[error("{message}")]
+    Setup {
+        /// User-facing message.
+        message: String,
+    },
+    /// An operation failed (bad credentials, missing entry, …).
+    #[error("{message}")]
+    Failed {
+        /// User-facing message.
+        message: String,
+    },
+    /// The session is locked (expired or never unlocked); unlock again.
+    #[error("the session is locked")]
+    SessionLocked,
+}
+
+// ===== The concrete App object ==============================================
+
+/// Worker handle + response channel, serialized behind one mutex (a single-vault
+/// app processes one request at a time).
+struct Inner {
+    session: Session,
+    responses: Receiver<Response>,
+}
+
+/// The concrete, non-generic password-manager handle exposed to Kotlin.
+#[derive(uniffi::Object)]
+pub struct PassmanApp {
+    inner: Mutex<Inner>,
+}
+
+#[uniffi::export]
+impl PassmanApp {
+    /// Open the app for the vault at `vault_path`, wiring the foreign Keystore
+    /// and clipboard bridges. Acquires the single-instance lock.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::Setup`] if the vault path cannot be locked/opened.
+    #[uniffi::constructor]
+    pub fn open(
+        vault_path: String,
+        keystore: Arc<dyn KeystoreBridge>,
+        clipboard: Arc<dyn ClipboardBridge>,
+        fact_overwrite: bool,
+    ) -> Result<Arc<Self>, AppError> {
+        let backend = AndroidKeyStore::new(Arc::new(KeystoreAdapter(keystore)));
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let app = App::open(&vault_path, backend, clock).map_err(|e| AppError::Setup {
+            message: format!("could not open the vault: {e}"),
+        })?;
+        let (session, responses) = Session::spawn(
+            app,
+            move || Ok(ClipboardAdapter(clipboard)),
+            Box::new(NoopPrompter),
+            fact_overwrite,
+        );
+        Ok(Arc::new(Self {
+            inner: Mutex::new(Inner { session, responses }),
+        }))
+    }
+
+    /// Create a new vault; returns the `otpauth://` provisioning URI (render it
+    /// as a QR — it embeds the TOTP seed) and enters the unlocked session.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::Failed`] if creation fails.
+    pub fn create_vault(&self, master: String, kdf: KdfChoice) -> Result<String, AppError> {
+        match self.call(Request::Create {
+            master: SecretString::new(master),
+            kdf: kdf.params(),
+        }) {
+            Response::Created {
+                provisioning_uri, ..
+            } => Ok(provisioning_uri.expose().to_owned()),
+            Response::CreateFailed { message } => Err(AppError::Failed { message }),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Unlock the vault; returns the entry list.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::Failed`] on bad credentials or a hardware error.
+    pub fn unlock(&self, master: String, code: String) -> Result<Vec<EntryItem>, AppError> {
+        match self.call(Request::Unlock {
+            master: SecretString::new(master),
+            code,
+        }) {
+            Response::Unlocked { entries } => Ok(entries.into_iter().map(EntryItem::from).collect()),
+            Response::UnlockFailed { message } => Err(AppError::Failed { message }),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Re-list the entries.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::SessionLocked`] if the session expired.
+    pub fn list(&self) -> Result<Vec<EntryItem>, AppError> {
+        self.expect_entries(Request::Refresh)
+    }
+
+    /// Reveal one field of an entry (for display; the UI obscures by default).
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::Failed`] / [`AppError::SessionLocked`].
+    pub fn reveal(&self, id: Vec<u8>, field: FieldKind) -> Result<String, AppError> {
+        let id = entry_id(&id)?;
+        match self.call(Request::Reveal {
+            id,
+            field: field.into(),
+        }) {
+            Response::Revealed { value, .. } => Ok(value.expose().to_owned()),
+            Response::Locked => Err(AppError::SessionLocked),
+            Response::Error { message } => Err(AppError::Failed { message }),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Copy one field to the clipboard; returns the cookie digest (pass it to
+    /// [`PassmanApp::clear_clipboard`] after the auto-clear delay).
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::Failed`] / [`AppError::SessionLocked`].
+    pub fn copy(&self, id: Vec<u8>, field: FieldKind) -> Result<Vec<u8>, AppError> {
+        let id = entry_id(&id)?;
+        match self.call(Request::Copy {
+            id,
+            field: field.into(),
+        }) {
+            Response::Copied { cookie } => Ok(cookie.digest().to_vec()),
+            Response::Locked => Err(AppError::SessionLocked),
+            Response::Error { message } => Err(AppError::Failed { message }),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Clear the clipboard if it still holds the value with `digest` (§5.3).
+    /// Fire-and-forget.
+    pub fn clear_clipboard(&self, digest: Vec<u8>) {
+        if let Ok(d) = <[u8; DIGEST_LEN]>::try_from(digest.as_slice()) {
+            let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            inner.session.send(Request::ClearClipboard {
+                cookie: ClipboardCookie::new(d, SystemClock.now()),
+            });
+        }
+    }
+
+    /// Add an entry; returns the refreshed entry list.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::Failed`] / [`AppError::SessionLocked`].
+    pub fn add(
+        &self,
+        label: String,
+        username: String,
+        password: String,
+        url: String,
+        notes: String,
+    ) -> Result<Vec<EntryItem>, AppError> {
+        self.expect_entries(Request::Add {
+            label,
+            username: SecretString::new(username),
+            password: SecretString::new(password),
+            url: SecretString::new(url),
+            notes: SecretString::new(notes),
+        })
+    }
+
+    /// Remove an entry; returns the refreshed entry list.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::Failed`] / [`AppError::SessionLocked`].
+    pub fn remove(&self, id: Vec<u8>) -> Result<Vec<EntryItem>, AppError> {
+        let id = entry_id(&id)?;
+        self.expect_entries(Request::Remove { id })
+    }
+
+    /// Generate a password (does not touch the vault while unlocked).
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::Failed`] / [`AppError::SessionLocked`].
+    pub fn generate(&self, length: u16) -> Result<String, AppError> {
+        match self.call(Request::Generate { length }) {
+            Response::Generated { password } => Ok(password.expose().to_owned()),
+            Response::Locked => Err(AppError::SessionLocked),
+            Response::Error { message } => Err(AppError::Failed { message }),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Lock the session (drop the keys).
+    pub fn lock(&self) {
+        let _ = self.call(Request::Lock);
+    }
+}
+
+impl PassmanApp {
+    /// Send one request and wait for the worker's single response, serialized.
+    fn call(&self, request: Request) -> Response {
+        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        inner.session.send(request);
+        inner.responses.recv().unwrap_or(Response::Error {
+            message: "the session worker has stopped".to_owned(),
+        })
+    }
+
+    /// Drive a request expected to yield an `Entries` response.
+    fn expect_entries(&self, request: Request) -> Result<Vec<EntryItem>, AppError> {
+        match self.call(request) {
+            Response::Entries { entries } => Ok(entries.into_iter().map(EntryItem::from).collect()),
+            Response::Locked => Err(AppError::SessionLocked),
+            Response::Error { message } => Err(AppError::Failed { message }),
+            other => Err(unexpected(&other)),
+        }
+    }
+}
+
+/// Map a 16-byte slice to an [`EntryId`].
+fn entry_id(bytes: &[u8]) -> Result<EntryId, AppError> {
+    let arr = <[u8; ENTRY_ID_LEN]>::try_from(bytes).map_err(|_| AppError::Failed {
+        message: "invalid entry id".to_owned(),
+    })?;
+    Ok(EntryId::from_bytes(arr))
+}
+
+/// An unexpected response for the request just sent (a logic error).
+fn unexpected(response: &Response) -> AppError {
+    if matches!(response, Response::Locked) {
+        AppError::SessionLocked
+    } else {
+        AppError::Failed {
+            message: "unexpected internal response".to_owned(),
+        }
+    }
+}
+
+/// Called once by the Kotlin side at startup to wire any global state. A no-op
+/// today (the Rust side holds no global state), but the Kotlin shim asserts it
+/// ran before any backend op (Task 7 Step 3 — replaces the non-firing
+/// `JNI_OnLoad`).
+#[uniffi::export]
+pub fn android_init() {}

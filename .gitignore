@@ -39,3 +39,5 @@ Thumbs.db
 
 # ── Local tool output (e.g. a redirected `cargo check` scratch dir) ────────
 cargocheck.*
+/crates/passman-uniffi/bindings/
+/crates/passman-uniffi/jniLibs/

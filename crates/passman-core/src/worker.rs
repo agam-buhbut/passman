@@ -18,13 +18,21 @@ use std::thread::{self, JoinHandle};
 use crate::{
     App, Clipboard, ClipboardCookie, CoreError, EntryHandle, RevealField, UnlockError, UnlockedApp,
 };
-use passman_crypto::SecretString;
+use passman_crypto::{KdfParams, SecretString};
 use passman_hsm::{BiometricPrompter, HardwareKeyStore};
 use passman_policy::{Charset, EntryPolicy, GenerationRequest, RequiredClasses};
+use passman_totp::TotpConfig;
 use passman_vault::{EntryId, EntryRecord};
 
 /// A message from the UI to the session worker.
 pub enum Request {
+    /// Create a brand-new vault, then enter the unlocked session.
+    Create {
+        /// Master password for the new vault.
+        master: SecretString,
+        /// Argon2id parameters for the master-key derivation.
+        kdf: KdfParams,
+    },
     /// Attempt to unlock with the master password and a TOTP code.
     Unlock { master: SecretString, code: String },
     /// Re-list the entries (after a mutation, or on demand).
@@ -61,6 +69,16 @@ pub enum Request {
 /// A message from the session worker back to the UI.
 #[derive(Debug)]
 pub enum Response {
+    /// Vault creation succeeded; carries the TOTP provisioning URI to render as
+    /// a QR (sensitive — it embeds the seed) and the (empty) entry list.
+    Created {
+        /// `otpauth://` provisioning URI (zeroizing).
+        provisioning_uri: SecretString,
+        /// The new vault's entries (empty).
+        entries: Vec<EntryHandle>,
+    },
+    /// Vault creation failed; carries a user-facing message.
+    CreateFailed { message: String },
     /// Unlock succeeded; carries the current entry list.
     Unlocked { entries: Vec<EntryHandle> },
     /// Unlock failed; carries a user-facing message.
@@ -161,6 +179,39 @@ fn run_worker<H, C>(
 {
     loop {
         match requests.recv() {
+            Ok(Request::Create { master, kdf }) => {
+                match app.create_vault(&master, kdf, TotpConfig::default(), &(), prompter.as_ref()) {
+                    Ok((mut unlocked, uri)) => {
+                        let entries = unlocked.list_entries().unwrap_or_default();
+                        let created = Response::Created {
+                            provisioning_uri: uri,
+                            entries,
+                        };
+                        if responses.send(created).is_err() {
+                            return;
+                        }
+                        if drive_unlocked(
+                            &mut unlocked,
+                            clipboard.as_ref(),
+                            fact_overwrite,
+                            requests,
+                            responses,
+                        ) {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        if responses
+                            .send(Response::CreateFailed {
+                                message: create_message(&e),
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
             Ok(Request::Unlock { master, code }) => {
                 match app.unlock(&master, code.trim(), &(), prompter.as_ref()) {
                     Ok(mut unlocked) => {
@@ -168,21 +219,14 @@ fn run_worker<H, C>(
                         if responses.send(Response::Unlocked { entries }).is_err() {
                             return;
                         }
-                        // Unlocked inner loop: `unlocked` borrows `app` and lives
-                        // only on this stack frame.
-                        match unlocked_loop(
+                        if drive_unlocked(
                             &mut unlocked,
                             clipboard.as_ref(),
                             fact_overwrite,
                             requests,
                             responses,
                         ) {
-                            Flow::Quit => return,
-                            // Lock / Continue both return to the locked loop; the
-                            // unlocked session drops here, zeroizing K_master.
-                            Flow::Lock | Flow::Continue => {
-                                let _ = responses.send(Response::Locked);
-                            }
+                            return;
                         }
                     }
                     Err(e) => {
@@ -202,6 +246,41 @@ fn run_worker<H, C>(
             // while it believes the session is unlocked).
             Ok(_) => {}
         }
+    }
+}
+
+/// Run the unlocked inner loop for an already-unlocked session and handle the
+/// resulting [`Flow`]. Returns `true` if the worker should quit entirely.
+fn drive_unlocked<H, C>(
+    unlocked: &mut UnlockedApp<H>,
+    clipboard: Option<&C>,
+    fact_overwrite: bool,
+    requests: &Receiver<Request>,
+    responses: &Sender<Response>,
+) -> bool
+where
+    H: HardwareKeyStore<PlatformCtx = ()>,
+    C: Clipboard,
+{
+    match unlocked_loop(unlocked, clipboard, fact_overwrite, requests, responses) {
+        Flow::Quit => true,
+        // Lock / Continue return to the locked loop; `unlocked` drops at the call
+        // site, zeroizing K_master.
+        Flow::Lock | Flow::Continue => {
+            let _ = responses.send(Response::Locked);
+            false
+        }
+    }
+}
+
+/// A user-facing message for a vault-creation failure.
+fn create_message(e: &CoreError) -> String {
+    match e {
+        CoreError::AlreadyRunning => "Another passman instance is using this vault.".to_owned(),
+        CoreError::SoftwareHsmRefused => {
+            "This device has no acceptable hardware key store.".to_owned()
+        }
+        _ => "The vault could not be created.".to_owned(),
     }
 }
 
@@ -245,8 +324,8 @@ where
     match request {
         Request::Lock => return Flow::Lock,
         Request::Quit => return Flow::Quit,
-        // Already unlocked; ignore a stray unlock.
-        Request::Unlock { .. } => {}
+        // Already unlocked; ignore a stray create/unlock.
+        Request::Create { .. } | Request::Unlock { .. } => {}
         Request::Refresh => match unlocked.list_entries() {
             Ok(entries) => send_or_lock(responses, Response::Entries { entries }),
             Err(e) => return on_op_error(&e, responses),
