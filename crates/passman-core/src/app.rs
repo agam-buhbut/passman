@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use passman_crypto::{
-    argon2id, hkdf_master, random_secret, KdfParams, SecretArray, SecretBytes, SecretString,
+    argon2id, hkdf_master, random_secret, KdfParams, MasterKey, SecretArray, SecretBytes,
+    SecretString,
 };
 use passman_hsm::{
     BiometricPrompter, HardwareKeyStore, HsmError, HsmKind, HsmLockoutStatus, HsmSlot, WrappedBlob,
@@ -484,7 +485,7 @@ impl<H: HardwareKeyStore> App<H> {
     /// Build an [`UnlockedApp`] with a fresh session token and a 120 s expiry.
     fn build_unlocked(
         &self,
-        k_master: SecretArray<KEY_LEN>,
+        k_master: MasterKey,
         index: passman_vault::Index,
     ) -> UnlockedApp<'_, H> {
         let now = self.now_unix_secs_u64();
@@ -576,7 +577,7 @@ pub(crate) fn derive_master(
     vault_salt: &[u8; KEY_LEN],
     kdf: &KdfParams,
     k_hsm: &SecretArray<KEY_LEN>,
-) -> Result<SecretArray<KEY_LEN>, CoreError> {
+) -> Result<MasterKey, CoreError> {
     let k_pw = argon2id(password, vault_salt, kdf)?;
 
     // Build the IKM = K_pw ‖ K_hsm inside a zeroizing buffer.
@@ -587,7 +588,7 @@ pub(crate) fn derive_master(
 
     let k_master = hkdf_master(vault_salt, ikm.expose(), MASTER_INFO);
     // `ikm` and `k_pw` drop here, scrubbing K_pw and the concatenation.
-    Ok(k_master)
+    Ok(MasterKey::new(k_master))
 }
 
 /// Variant of [`derive_master`] that accepts `k_hsm` as raw [`SecretBytes`]
@@ -597,7 +598,7 @@ pub(crate) fn derive_master_from_bytes(
     vault_salt: &[u8; KEY_LEN],
     kdf: &KdfParams,
     k_hsm: &SecretBytes,
-) -> Result<SecretArray<KEY_LEN>, CoreError> {
+) -> Result<MasterKey, CoreError> {
     let arr = into_key(k_hsm).ok_or(CoreError::Hsm(HsmError::MalformedBlob {
         reason: "unwrapped K_hsm is not 32 bytes",
     }))?;

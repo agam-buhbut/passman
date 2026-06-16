@@ -10,7 +10,7 @@
 //! check, bucket padding, and a battery of malformed-input parser-robustness
 //! cases (each must return `Err`, never panic).
 
-use passman_crypto::{KdfParams, SecretArray, SecretString};
+use passman_crypto::{KdfParams, MasterKey, SecretArray, SecretString};
 use passman_policy::EntryPolicy;
 use passman_vault::{
     EntryId, EntryRecord, IndexEntry, Vault, VaultError, VaultMetadata, FORMAT_VERSION,
@@ -21,12 +21,12 @@ use passman_vault::{
 // Fixtures
 // ---------------------------------------------------------------------------
 
-fn k_master() -> SecretArray<32> {
-    SecretArray::new([7u8; 32])
+fn k_master() -> MasterKey {
+    MasterKey::new(SecretArray::new([7u8; 32]))
 }
 
-fn other_k_master() -> SecretArray<32> {
-    SecretArray::new([9u8; 32])
+fn other_k_master() -> MasterKey {
+    MasterKey::new(SecretArray::new([9u8; 32]))
 }
 
 fn fixed_salt() -> [u8; 32] {

@@ -3,13 +3,14 @@
 //!
 //! `Vault` is pure: it parses from and serializes to `&[u8]`/`Vec<u8>` and
 //! performs no I/O (`architecture.md` §2.3). It does not derive the master key;
-//! it receives `K_master: &SecretArray<32>` and derives `K_index` and per-entry
+//! it receives `K_master: &MasterKey` and derives `K_index` and per-entry
 //! `K_entry` from it via [`passman_crypto::hkdf_expand`] (`architecture.md`
 //! §4.2). The binary format follows the offset table in `architecture.md` §4.7
 //! byte-for-byte.
 
 use passman_crypto::{
-    aead, ct_eq, hkdf_expand, random_nonce, KdfParams, SecretArray, SecretBytes, KDF_PARAMS_LEN,
+    aead, ct_eq, hkdf_expand, random_nonce, EntryKey, KdfParams, MasterKey, SecretBytes,
+    KDF_PARAMS_LEN,
 };
 use passman_policy::EntryPolicy;
 
@@ -208,7 +209,7 @@ impl Vault {
         k_hsm_wrap_blob: Vec<u8>,
         totp_seed_wrap_blob: Vec<u8>,
         metadata: VaultMetadata,
-        k_master: &SecretArray<32>,
+        k_master: &MasterKey,
     ) -> Result<Self, VaultError> {
         let probe_nonce = random_nonce();
         let probe_ad = probe_associated_data(
@@ -261,7 +262,7 @@ impl Vault {
     ///
     /// [`VaultError::Crypto`] on AEAD authentication failure (wrong creds or a
     /// tampered probe-AD-bound field).
-    pub fn verify_probe(&self, k_master: &SecretArray<32>) -> Result<(), VaultError> {
+    pub fn verify_probe(&self, k_master: &MasterKey) -> Result<(), VaultError> {
         let ad = probe_associated_data(
             self.format_version,
             self.kdf_algorithm_id,
@@ -295,7 +296,7 @@ impl Vault {
     /// - [`VaultError::MalformedRecord`] if the decrypted index is not valid
     ///   postcard.
     /// - [`VaultError::IndexMismatch`] if the id sets differ.
-    pub fn open_index(&self, k_master: &SecretArray<32>) -> Result<Index, VaultError> {
+    pub fn open_index(&self, k_master: &MasterKey) -> Result<Index, VaultError> {
         let index = self.decrypt_index(k_master)?;
         self.check_index_envelope_sets(&index)?;
         Ok(index)
@@ -320,7 +321,7 @@ impl Vault {
     ///   structurally invalid.
     pub fn decrypt_entry(
         &self,
-        k_master: &SecretArray<32>,
+        k_master: &MasterKey,
         id: &EntryId,
     ) -> Result<EntryRecord, VaultError> {
         let envelope = self
@@ -329,7 +330,7 @@ impl Vault {
             .find(|e| &e.id == id)
             .ok_or(VaultError::EntryNotFound)?;
 
-        let key = hkdf_expand(k_master, &entry_info(id));
+        let key = EntryKey::new(hkdf_expand(k_master, &entry_info(id)));
         let ad = entry_associated_data(self.format_version, id);
         let plaintext = aead::decrypt(&key, &envelope.nonce, &ad, &envelope.ciphertext_and_tag)
             .map_err(auth_failure)?;
@@ -351,7 +352,7 @@ impl Vault {
     /// inputs).
     pub fn add_or_update_entry(
         &mut self,
-        k_master: &SecretArray<32>,
+        k_master: &MasterKey,
         id: EntryId,
         label: String,
         policy: EntryPolicy,
@@ -383,7 +384,7 @@ impl Vault {
     ///   the index fails.
     pub fn remove_entry(
         &mut self,
-        k_master: &SecretArray<32>,
+        k_master: &MasterKey,
         id: &EntryId,
     ) -> Result<(), VaultError> {
         let before = self.envelopes.len();
@@ -420,7 +421,7 @@ impl Vault {
 
     /// Decrypt the sealed index without the envelope-set check (internal: the
     /// mutation path needs the rows but rebuilds the set itself).
-    fn decrypt_index(&self, k_master: &SecretArray<32>) -> Result<Index, VaultError> {
+    fn decrypt_index(&self, k_master: &MasterKey) -> Result<Index, VaultError> {
         let key = hkdf_expand(k_master, INDEX_INFO);
         let ad = [self.format_version];
         let plaintext = aead::decrypt(&key, &self.sealed_index_nonce, &ad, &self.sealed_index_ct)
@@ -436,7 +437,7 @@ impl Vault {
     fn reseal_index(
         &mut self,
         index: &Index,
-        k_master: &SecretArray<32>,
+        k_master: &MasterKey,
     ) -> Result<(), VaultError> {
         let (nonce, ct) = seal_index(index, k_master)?;
         self.sealed_index_nonce = nonce;
@@ -670,7 +671,7 @@ fn entry_associated_data(format_version: u8, id: &EntryId) -> [u8; 1 + ENTRY_ID_
 /// with `ad = [format_version]`, using a fresh nonce. Returns `(nonce, ct)`.
 fn seal_index(
     index: &Index,
-    k_master: &SecretArray<32>,
+    k_master: &MasterKey,
 ) -> Result<([u8; NONCE_LEN], Vec<u8>), VaultError> {
     let key = hkdf_expand(k_master, INDEX_INFO);
     let plaintext =
@@ -687,12 +688,12 @@ fn seal_index(
 /// fresh nonce and `ad = format_version ‖ id`. The plaintext is bucket-padded
 /// before encryption (the true length is authenticated inside it).
 fn encrypt_entry(
-    k_master: &SecretArray<32>,
+    k_master: &MasterKey,
     format_version: u8,
     id: EntryId,
     record: &EntryRecord,
 ) -> Result<EntryEnvelope, VaultError> {
-    let key = hkdf_expand(k_master, &entry_info(&id));
+    let key = EntryKey::new(hkdf_expand(k_master, &entry_info(&id)));
     let padded: SecretBytes = record.encode_padded();
     let nonce = random_nonce();
     let ad = entry_associated_data(format_version, &id);

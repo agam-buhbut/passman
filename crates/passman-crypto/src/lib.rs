@@ -9,6 +9,7 @@
 //!
 //! - [`secret`] — zeroizing wrappers ([`SecretString`], [`SecretArray`],
 //!   [`SecretBytes`]).
+//! - [`key`] — role-typed key newtypes ([`MasterKey`], [`EntryKey`]).
 //! - [`error`] — the [`CryptoError`] taxonomy.
 //! - [`kdf`] — Argon2id password-based derivation and [`KdfParams`].
 //! - [`derive`] — HKDF-SHA256 extract/expand.
@@ -25,6 +26,7 @@ pub mod ct;
 pub mod derive;
 pub mod error;
 pub mod kdf;
+pub mod key;
 pub mod rng;
 pub mod secret;
 
@@ -32,5 +34,6 @@ pub use ct::ct_eq;
 pub use derive::{hkdf_expand, hkdf_master};
 pub use error::CryptoError;
 pub use kdf::{argon2id, KdfParams, KDF_PARAMS_LEN};
+pub use key::{EntryKey, MasterKey};
 pub use rng::{fill_random, random_nonce, random_secret};
 pub use secret::{SecretArray, SecretBytes, SecretString};

@@ -10,7 +10,7 @@
 //! Passwords are decrypted **on demand** (reveal / copy / export), never in
 //! bulk; only labels live in memory while unlocked (§4.4).
 
-use passman_crypto::{ct_eq, SecretArray, SecretString};
+use passman_crypto::{ct_eq, MasterKey, SecretArray, SecretString};
 use passman_hsm::{BiometricPrompter, HsmSlot};
 use passman_policy::{
     classify, estimate_master, generate, EntryPolicy, GenerationRequest, MasterEntropy,
@@ -67,7 +67,7 @@ pub struct UnlockedApp<'a, H: passman_hsm::HardwareKeyStore> {
     /// The parent locked handle (backend, clock, path).
     app: &'a App<H>,
     /// The root vault key. Zeroizing; scrubbed on drop.
-    k_master: SecretArray<KEY_LEN>,
+    k_master: MasterKey,
     /// The decrypted index (labels + policies only).
     index: Index,
     /// Session expiry as Unix seconds (no sliding — `architecture.md` §5.2).
@@ -90,7 +90,7 @@ impl<'a, H: passman_hsm::HardwareKeyStore> UnlockedApp<'a, H> {
     /// Construct an unlocked session. Crate-internal: only [`App`] builds these.
     pub(crate) fn new(
         app: &'a App<H>,
-        k_master: SecretArray<KEY_LEN>,
+        k_master: MasterKey,
         index: Index,
         session_expiry: u64,
         session_token: SessionToken,
@@ -484,7 +484,7 @@ impl<'a, H: passman_hsm::HardwareKeyStore> UnlockedApp<'a, H> {
         source: &Vault,
         new_salt: &[u8; KEY_LEN],
         kdf: passman_crypto::KdfParams,
-        new_master: &SecretArray<KEY_LEN>,
+        new_master: &MasterKey,
     ) -> Result<Vault, CoreError> {
         let mut meta = source.metadata();
         meta.last_password_change = self.now_i64();
