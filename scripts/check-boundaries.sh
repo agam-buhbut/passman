@@ -38,6 +38,9 @@ allowed[passman-hsm]="passman-crypto"
 allowed[passman-recovery]="passman-crypto"
 allowed[passman-vault]="passman-crypto passman-policy"
 allowed[passman-core]="passman-crypto passman-totp passman-policy passman-vault passman-hsm passman-recovery"
+# passman-platform is an independent shell-support leaf (paths + settings). It
+# depends on no other passman crate — the binaries compose it with passman-core.
+allowed[passman-platform]=""
 
 for dir in crates/*/; do
     name=$(awk -F\" '/^name *=/{print $2; exit}' "$dir/Cargo.toml")
@@ -77,7 +80,7 @@ done
 # lib.rs explains in prose why it is *not* forbid-unsafe; that must not match).
 # hsm is intentionally excluded (it needs `unsafe` for platform FFI).
 
-needs_forbid="passman-crypto passman-totp passman-policy passman-vault passman-recovery passman-core"
+needs_forbid="passman-crypto passman-totp passman-policy passman-vault passman-recovery passman-core passman-platform"
 for c in $needs_forbid; do
     if ! grep -qE '^[[:space:]]*#!\[forbid\(unsafe_code\)\]' "crates/$c/src/lib.rs"; then
         err "$c is missing #![forbid(unsafe_code)] in src/lib.rs"

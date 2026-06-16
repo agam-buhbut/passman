@@ -8,6 +8,7 @@ members = [
     "crates/passman-hsm",
     "crates/passman-recovery",
     "crates/passman-core",
+    "crates/passman-platform",
 ]
 
 [workspace.package]
@@ -33,6 +34,12 @@ serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 base32 = "0.5"
+
+# Platform shell support (passman-platform): per-platform path resolution and
+# the plaintext, non-secret settings.toml (architecture.md §1.5). Conservative,
+# widely-used crates; not pulled into the pure security core.
+toml = "0.8"
+directories = "5"
 
 # Linux HSM backends (passman-hsm only, behind opt-in features; never in the
 # default build). Pulled in by the crate as `optional = true`.
