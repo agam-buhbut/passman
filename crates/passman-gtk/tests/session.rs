@@ -13,8 +13,8 @@ use sha2::{Digest, Sha256};
 
 use passman_core::{App, Clipboard, ClipboardCookie, CoreError, RevealField};
 use passman_crypto::{KdfParams, SecretString};
-use passman_gtk::session::{Request, Response};
-use passman_gtk::Session;
+use passman_core::worker::{Request, Response};
+use passman_core::Session;
 use passman_hsm::mock::{MockKeyStore, MockPrompter};
 use passman_hsm::{
     BiometricPrompter, HardwareKeyStore, HsmCapabilities, HsmError, HsmKind, HsmSlot, UnwrapHandle,

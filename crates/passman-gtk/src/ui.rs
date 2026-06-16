@@ -25,7 +25,7 @@ use passman_totp::{Clock, SystemClock};
 use passman_vault::EntryId;
 
 use crate::clipboard::SystemClipboard;
-use crate::session::{Request, Response, Session};
+use passman_core::{Request, Response, Session};
 
 /// GTK application id.
 const APP_ID: &str = "org.passman.Gtk";

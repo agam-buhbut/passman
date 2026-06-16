@@ -47,6 +47,9 @@ allowed[passman-cli]="passman-crypto passman-totp passman-policy passman-vault p
 # passman-gtk is the GTK4 desktop binary shell; like the CLI it may depend on any
 # library crate.
 allowed[passman-gtk]="passman-crypto passman-totp passman-policy passman-vault passman-hsm passman-recovery passman-core passman-platform"
+# passman-uniffi is the Android binding shell (concrete App<AndroidKeyStore> +
+# foreign callbacks); it may depend on any library crate.
+allowed[passman-uniffi]="passman-crypto passman-totp passman-policy passman-vault passman-hsm passman-recovery passman-core passman-platform"
 
 for dir in crates/*/; do
     name=$(awk -F\" '/^name *=/{print $2; exit}' "$dir/Cargo.toml")

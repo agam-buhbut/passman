@@ -38,6 +38,7 @@ mod provisioning;
 mod session;
 mod storage;
 mod unlocked;
+pub mod worker;
 
 pub use app::{App, ProvisioningUri};
 pub use clipboard::{ClearOutcome, Clipboard, ClipboardCookie, FACTS};
@@ -47,3 +48,4 @@ pub use progress::{NoProgress, Progress, ProgressError};
 pub use session::SessionToken;
 pub use storage::{atomic_write, read, InstanceLock};
 pub use unlocked::{EntryHandle, PasswordChangeOutcome, RevealField, UnlockedApp};
+pub use worker::{Request, Response, Session};

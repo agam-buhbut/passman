@@ -11,6 +11,7 @@ members = [
     "crates/passman-platform",
     "crates/passman-cli",
     "crates/passman-gtk",
+    "crates/passman-uniffi",
 ]
 
 [workspace.package]
@@ -52,6 +53,10 @@ arboard = "3"
 
 # Linux GTK4 desktop shell (passman-gtk). Shell-only.
 gtk4 = "0.9"
+
+# Android UniFFI binding surface (passman-uniffi). Pinned to 0.28 (the Android
+# plan's chosen line); the bindgen must match this exact patch.
+uniffi = "0.28"
 
 # Linux HSM backends (passman-hsm only, behind opt-in features; never in the
 # default build). Pulled in by the crate as `optional = true`.

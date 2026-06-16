@@ -1,19 +1,21 @@
 //! The session actor: a worker thread that owns the `App` and, while unlocked,
 //! the `UnlockedApp`.
 //!
-//! GTK is single-threaded and must never block on the multi-second Argon2id of
-//! `unlock`. The actor solves both that and a borrow problem: `UnlockedApp`
-//! borrows its `App`, so the unlocked session cannot be sent back to the UI
-//! thread. Instead the worker owns `App` for its whole life and keeps the
-//! borrowed `UnlockedApp` as a stack local in an inner loop — the UI drives it
-//! by sending [`Request`]s and receiving [`Response`]s over channels.
+//! A single-threaded shell (a GTK main loop, a `UniFFI` foreign caller) must not
+//! block on the multi-second Argon2id of `unlock`. The actor solves both that
+//! and a borrow problem: `UnlockedApp` borrows its `App`, so the unlocked
+//! session cannot be sent back to the caller. Instead the worker owns `App` for
+//! its whole life and keeps the borrowed `UnlockedApp` as a stack local in an
+//! inner loop — the shell drives it by sending [`Request`]s and receiving
+//! [`Response`]s over channels.
 //!
-//! This module is **GTK-free** so it can be tested against the mock backend.
+//! Reused by every shell (desktop GUI, mobile binding), so it is UI-toolkit-free
+//! and tested against the mock backend.
 
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
-use passman_core::{
+use crate::{
     App, Clipboard, ClipboardCookie, CoreError, EntryHandle, RevealField, UnlockError, UnlockedApp,
 };
 use passman_crypto::SecretString;
@@ -99,7 +101,7 @@ impl Session {
     ) -> (Self, Receiver<Response>)
     where
         H: HardwareKeyStore<PlatformCtx = ()> + Send + 'static,
-        F: FnOnce() -> anyhow::Result<C> + Send + 'static,
+        F: FnOnce() -> Result<C, CoreError> + Send + 'static,
         C: Clipboard,
     {
         let (req_tx, req_rx) = std::sync::mpsc::channel();

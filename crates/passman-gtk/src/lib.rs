@@ -9,10 +9,10 @@
 
 pub mod clipboard;
 mod prompter;
-pub mod session;
 mod ui;
 
 pub use clipboard::SystemClipboard;
 pub use prompter::DesktopPrompter;
-pub use session::{Request, Response, Session};
+// The session actor lives in passman-core (shared with the mobile binding).
+pub use passman_core::{Request, Response, Session};
 pub use ui::run;
