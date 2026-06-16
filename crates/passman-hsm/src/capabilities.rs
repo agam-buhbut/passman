@@ -37,6 +37,34 @@ pub struct HsmCapabilities {
     pub supports_distinct_slot_pin: bool,
 }
 
+/// The backend's *current* native dictionary-attack lockout state
+/// (`architecture.md` §4.3 step 3).
+///
+/// Distinct from [`LockoutRecovery`], which is a static capability describing
+/// *how* a lockout clears; this reports whether a lockout is active **right
+/// now**. `passman-core` queries it before the unwraps so the UI can warn
+/// before firing a biometric prompt against an already-locked device.
+///
+/// This is **not** a separate security control: a real lockout already fails an
+/// unlock closed via the backend's unwrap error path (e.g. the TPM2 backend maps
+/// `TPM_RC_LOCKOUT` to [`crate::HsmError::Transient`]). The query is a proactive
+/// UX refinement. Backends that cannot cheaply pre-query their counter inherit
+/// the default [`HsmLockoutStatus::Available`] from
+/// [`crate::HardwareKeyStore::lockout_status`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HsmLockoutStatus {
+    /// Not locked out; an unwrap may proceed.
+    Available,
+    /// A native DA lockout is currently active. `retry_after` is the remaining
+    /// cooldown when the backend can report it (e.g. a TPM DA cooldown), else
+    /// `None` (the lockout clears by some non-timed event such as a credential
+    /// reset).
+    LockedOut {
+        /// Remaining cooldown until the lockout self-clears, if known.
+        retry_after: Option<Duration>,
+    },
+}
+
 /// How a triggered hardware dictionary-attack lockout is recovered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LockoutRecovery {

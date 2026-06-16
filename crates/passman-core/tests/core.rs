@@ -945,3 +945,52 @@ fn recovery_round_trip_real_floor() {
         .expect("reveal");
     assert_eq!(pw_seen, "hunter2!");
 }
+
+/// A prompter that panics if invoked — used to prove a code path fired **no**
+/// biometric prompt.
+struct PanicPrompter;
+
+impl BiometricPrompter for PanicPrompter {
+    fn prompt(&self, _reason: String) -> Result<passman_hsm::PromptResult, HsmError> {
+        panic!("biometric prompt must not fire when the device is HSM-locked");
+    }
+}
+
+#[test]
+fn hsm_native_lockout_blocks_unlock_before_any_prompt() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clock = TestClock::at(14_000_000);
+    let path = dir.path().join("vault.pmv");
+
+    // A backend reporting a 600 s native DA lockout. enroll/unwrap still work,
+    // so create_vault (which does not query lockout status) succeeds.
+    let backend = MockKeyStore::locked_for(std::time::Duration::from_mins(10));
+    let app = App::open_allowing_software_hsm(path, backend, clock.clone() as Arc<dyn Clock>)
+        .expect("open");
+    let prompter = MockPrompter::authenticating();
+    let (unlocked, uri) = app
+        .create_vault(
+            &pw("Str0ng-Master-P@ssphrase!"),
+            FAST_KDF,
+            TotpConfig::default(),
+            &(),
+            &prompter,
+        )
+        .expect("create");
+    let seed = seed_from_uri(uri.expose());
+    unlocked.lock();
+
+    // Unlock with the CORRECT credentials but a prompter that panics if called.
+    // The §4.3 step-3 HSM-native lockout check must short-circuit to LockedOut
+    // before any unwrap or biometric prompt.
+    let code = valid_code(&seed, clock.now_secs());
+    let err = app
+        .unlock(&pw("Str0ng-Master-P@ssphrase!"), &code, &(), &PanicPrompter)
+        .expect_err("locked device must refuse unlock");
+    match err {
+        UnlockError::LockedOut { remaining } => {
+            assert_eq!(remaining, std::time::Duration::from_mins(10));
+        }
+        other => panic!("expected LockedOut, got {other:?}"),
+    }
+}

@@ -11,7 +11,7 @@
 use passman_crypto::SecretBytes;
 
 use crate::blob::WrappedBlob;
-use crate::capabilities::HsmCapabilities;
+use crate::capabilities::{HsmCapabilities, HsmLockoutStatus};
 use crate::error::HsmError;
 use crate::handle::UnwrapHandle;
 use crate::prompt::BiometricPrompter;
@@ -34,6 +34,34 @@ pub trait HardwareKeyStore: Send + Sync {
 
     /// What this backend can do, for UX messaging (§4.9).
     fn capabilities(&self) -> HsmCapabilities;
+
+    /// Query the backend's *current* native dictionary-attack lockout state
+    /// (`architecture.md` §4.3 step 3). `passman-core` calls this before the
+    /// unwraps; a [`HsmLockoutStatus::LockedOut`] short-circuits the unlock so
+    /// the UI never fires a biometric prompt against an already-locked device.
+    ///
+    /// The default returns [`HsmLockoutStatus::Available`]: a backend with no
+    /// cheaply-queryable counter (the software mock, the `SecretService`
+    /// fallback, Android — whose lockout surfaces only as a prompt error, and
+    /// the no-PIN TPM2 object) inherits it. That is **not** a hole in the
+    /// security model: a real lockout still fails the unlock closed via the
+    /// unwrap error path (e.g. TPM2 maps `TPM_RC_LOCKOUT` to
+    /// [`HsmError::Transient`]). Only a backend that can pre-query its DA
+    /// counter cheaply and reliably should override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`HsmError`] only if the *query itself* fails (e.g.
+    /// [`HsmError::HardwareAbsent`]); a successful query of a locked device
+    /// returns `Ok(LockedOut { .. })`. `passman-core` treats a query *error* as
+    /// non-fatal (the unwrap path still fails closed on a real lockout).
+    fn lockout_status(
+        &self,
+        ctx: &Self::PlatformCtx,
+    ) -> Result<HsmLockoutStatus, HsmError> {
+        let _ = ctx;
+        Ok(HsmLockoutStatus::Available)
+    }
 
     /// Wrap `material` for `slot`, returning an opaque [`WrappedBlob`].
     ///

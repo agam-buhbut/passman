@@ -63,7 +63,7 @@ pub mod android;
 pub mod linux;
 
 pub use blob::WrappedBlob;
-pub use capabilities::{HsmCapabilities, LockoutRecovery};
+pub use capabilities::{HsmCapabilities, HsmLockoutStatus, LockoutRecovery};
 pub use error::HsmError;
 pub use handle::UnwrapHandle;
 pub use prompt::{BiometricPrompter, PromptResult};

@@ -8,11 +8,14 @@
 //! within one process (§4.3 step 4).
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use passman_crypto::{
     argon2id, hkdf_master, random_secret, KdfParams, SecretArray, SecretBytes, SecretString,
 };
-use passman_hsm::{BiometricPrompter, HardwareKeyStore, HsmError, HsmKind, HsmSlot, WrappedBlob};
+use passman_hsm::{
+    BiometricPrompter, HardwareKeyStore, HsmError, HsmKind, HsmLockoutStatus, HsmSlot, WrappedBlob,
+};
 use passman_totp::{Clock, TotpConfig, TotpVerifier};
 use passman_vault::{Vault, VaultMetadata};
 
@@ -31,6 +34,15 @@ pub(crate) const KEY_LEN: usize = 32;
 
 /// The hard session lifetime from unlock, in seconds (`architecture.md` §5.2).
 pub(crate) const SESSION_SECS: u64 = 120;
+
+/// Fallback "retry after" reported to the UI when a backend signals a native
+/// lockout but provides no cooldown duration and the advisory timer is also
+/// silent (`architecture.md` §4.3 step 3). Currently unreachable with the
+/// in-tree backends (they either inherit the `Available` default or, in the
+/// mock, always supply a duration); kept as a defensive default so a future
+/// backend returning `LockedOut { retry_after: None }` still yields a sane UI
+/// hint rather than a zero/`MAX` duration.
+const HSM_LOCKOUT_FALLBACK: Duration = Duration::from_mins(1);
 
 /// An `otpauth://` provisioning URI for the TOTP seed, held as a
 /// [`SecretString`] so it is zeroized after the shell renders its QR code
@@ -219,7 +231,23 @@ impl<H: HardwareKeyStore> App<H> {
         let mut vault =
             Vault::from_bytes(&bytes).map_err(|e| UnlockError::MalformedVault(e.into()))?;
 
-        // Step 2: unwrap both slots. Map HsmError per §4.3.
+        let now = self.clock.now();
+        let mut state = LockoutState::new(vault.rl_counter(), vault.rl_last_failure());
+
+        // Step 3 (HSM-native DA lockout, §4.3): the *authoritative* anti-hammering
+        // control. Queried before the unwraps so an already-locked device never
+        // fires a biometric prompt. A query *error* is non-fatal — the unwrap path
+        // still fails closed on a real lockout (e.g. the TPM2 backend maps
+        // `TPM_RC_LOCKOUT` to `HsmError::Transient`), so we only act on a positive
+        // `LockedOut`. The advisory app-timer check further down is UX only (§4.9).
+        if let Ok(HsmLockoutStatus::LockedOut { retry_after }) = self.backend.lockout_status(ctx) {
+            let remaining = retry_after
+                .or_else(|| state.remaining(now))
+                .unwrap_or(HSM_LOCKOUT_FALLBACK);
+            return Err(UnlockError::LockedOut { remaining });
+        }
+
+        // Steps 1–2 (cont.): unwrap both slots. Map HsmError per §4.3.
         let k_hsm = self.unwrap_slot(HsmSlot::VaultKey, vault.k_hsm_wrap_blob(), ctx, prompter)?;
         let seed = self.unwrap_slot(
             HsmSlot::TotpSeed,
@@ -228,10 +256,8 @@ impl<H: HardwareKeyStore> App<H> {
             prompter,
         )?;
 
-        // Step 3: advisory-lockout check (UX layer). The HSM's native DA
-        // protection is the real control (§4.9).
-        let now = self.clock.now();
-        let mut state = LockoutState::new(vault.rl_counter(), vault.rl_last_failure());
+        // Advisory-lockout check (UX layer; §4.9). The HSM's native DA protection
+        // checked above is the real control.
         if let Some(remaining) = state.remaining(now) {
             return Err(UnlockError::LockedOut { remaining });
         }

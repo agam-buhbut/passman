@@ -32,7 +32,7 @@ use std::time::Duration;
 use passman_crypto::{aead, random_nonce, random_secret, SecretArray, SecretBytes};
 
 use crate::blob::WrappedBlob;
-use crate::capabilities::{HsmCapabilities, LockoutRecovery};
+use crate::capabilities::{HsmCapabilities, HsmLockoutStatus, LockoutRecovery};
 use crate::error::HsmError;
 use crate::handle::UnwrapHandle;
 use crate::prompt::{BiometricPrompter, PromptResult};
@@ -84,6 +84,11 @@ pub struct MockKeyStore {
     /// When set, every operation returns this failure (for testing core's
     /// error routing).
     forced_failure: Option<MockFailure>,
+    /// When set, [`HardwareKeyStore::lockout_status`] reports a native lockout
+    /// with this remaining cooldown (for testing core's §4.3 step-3 check). The
+    /// enroll/unwrap ops are unaffected — a real device's lockout is queried
+    /// separately from the wrap/unwrap path.
+    lockout: Option<Duration>,
 }
 
 impl MockKeyStore {
@@ -93,6 +98,20 @@ impl MockKeyStore {
         Self {
             key: random_secret::<32>(),
             forced_failure: None,
+            lockout: None,
+        }
+    }
+
+    /// A working mock that reports a native DA lockout for `retry_after` via
+    /// [`HardwareKeyStore::lockout_status`] (test/dev only). `enroll` and the
+    /// unwrap phases still function, so core's §4.3 step-3 short-circuit (which
+    /// must fire *before* any unwrap or prompt) can be exercised.
+    #[must_use]
+    pub fn locked_for(retry_after: Duration) -> Self {
+        Self {
+            key: random_secret::<32>(),
+            forced_failure: None,
+            lockout: Some(retry_after),
         }
     }
 
@@ -122,6 +141,7 @@ impl MockKeyStore {
         Self {
             key: random_secret::<32>(),
             forced_failure: Some(failure),
+            lockout: None,
         }
     }
 
@@ -147,6 +167,7 @@ impl MockKeyStore {
         Self {
             key: random_secret::<32>(),
             forced_failure: Some(failure),
+            lockout: None,
         }
     }
 
@@ -193,6 +214,15 @@ impl HardwareKeyStore for MockKeyStore {
             },
             supports_distinct_slot_pin: true,
         }
+    }
+
+    fn lockout_status(&self, _ctx: &Self::PlatformCtx) -> Result<HsmLockoutStatus, HsmError> {
+        Ok(match self.lockout {
+            Some(retry_after) => HsmLockoutStatus::LockedOut {
+                retry_after: Some(retry_after),
+            },
+            None => HsmLockoutStatus::Available,
+        })
     }
 
     fn enroll(
