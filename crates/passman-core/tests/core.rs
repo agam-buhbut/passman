@@ -1068,3 +1068,66 @@ fn progress_brackets_each_argon2_operation() {
     );
     unlocked.lock();
 }
+
+#[test]
+fn import_recovery_round_trips_via_cheap_file() {
+    use passman_policy::EntryPolicy;
+    use passman_recovery::{export_unchecked, ExportPayload, RecoveryEntry};
+
+    // Hand-build a recovery payload: one entry plus a known TOTP seed. The
+    // policy bytes are postcard(EntryPolicy), matching the export DTO (§7.3).
+    let policy_bytes = postcard::to_allocvec(&EntryPolicy::default()).expect("encode policy");
+    let payload = ExportPayload {
+        totp_seed: passman_crypto::SecretArray::new([0x5Au8; 32]),
+        original_vault_kdf: FAST_KDF,
+        entries: vec![RecoveryEntry {
+            id: [0x11u8; 16],
+            label: "GitHub".to_owned(),
+            username: pw("octocat"),
+            password: pw("hunter2!"),
+            url: pw("https://github.com"),
+            notes: pw("recovered"),
+            policy: policy_bytes,
+        }],
+    };
+
+    // Export it cheaply (bypassing the 1 GiB Floor via the test-util seam).
+    let recovery_master = pw("Recover-Me-Str0ng-Passphrase!");
+    let file = export_unchecked(&payload, &recovery_master, &FAST_KDF).expect("export file");
+
+    // Import into a fresh vault: exercises App::import_recovery end-to-end
+    // (decrypt payload → enroll two slots → re-derive K_master → re-encrypt).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clock = TestClock::at(17_000_000);
+    let app = open_app(dir.path(), clock.clone());
+    let prompter = MockPrompter::authenticating();
+    let (unlocked, uri) = app
+        .import_recovery(
+            &file,
+            &recovery_master,
+            FAST_KDF,
+            TotpConfig::default(),
+            &(),
+            &prompter,
+        )
+        .expect("import_recovery");
+
+    let handles = unlocked.list_entries().expect("list");
+    assert_eq!(handles.len(), 1);
+    assert_eq!(handles[0].label, "GitHub");
+    let seen = unlocked
+        .with_revealed(&handles[0].id, |r| r.password.expose().to_owned())
+        .expect("reveal");
+    assert_eq!(seen, "hunter2!");
+
+    // The provisioning URI re-provisions the SAME seed: a code from it unlocks
+    // the freshly-imported vault with the recovery password.
+    let totp_seed = seed_from_uri(uri.expose());
+    unlocked.lock();
+    let code = valid_code(&totp_seed, clock.now_secs());
+    let unlocked2 = app
+        .unlock(&recovery_master, &code, &(), &prompter)
+        .expect("unlock after import");
+    assert_eq!(unlocked2.list_entries().expect("list2").len(), 1);
+    unlocked2.lock();
+}

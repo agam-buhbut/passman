@@ -133,6 +133,28 @@ pub(crate) fn export_with(
     Ok(file)
 }
 
+/// Test-only export that **bypasses the recovery Floor gate** (`architecture.md`
+/// §7.4) so a downstream crate's tests can build a valid recovery file with
+/// cheap Argon2 parameters (the public [`export`]'s 1 GiB Floor is far too slow
+/// for a normal test run).
+///
+/// Behind the `test-util` feature, which is **never** enabled in a production
+/// build — only `passman-core`'s dev-dependencies turn it on. Production code
+/// must call [`export`], which always enforces the Floor.
+///
+/// # Errors
+///
+/// [`RecoveryError::Crypto`] if Argon2id rejects the parameters or AEAD
+/// encryption fails.
+#[cfg(feature = "test-util")]
+pub fn export_unchecked(
+    payload: &ExportPayload,
+    password: &SecretString,
+    recovery_params: &KdfParams,
+) -> Result<Vec<u8>, RecoveryError> {
+    export_with(payload, password, recovery_params)
+}
+
 /// Import a recovery file (`architecture.md` §7.2–§7.6, crypto path).
 ///
 /// A bounds-checked, panic-free parser: validates the magic, format version,

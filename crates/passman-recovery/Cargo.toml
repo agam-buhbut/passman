@@ -6,6 +6,14 @@ rust-version.workspace = true
 publish = false
 description = "Recovery export/import: password-only Argon2id, zeroizing payload framing. Pure, no I/O."
 
+[features]
+# Test-only: exposes `export_unchecked`, which bypasses the recovery Floor gate
+# (§7.4) so downstream crates' tests can build a valid recovery file with cheap
+# Argon2 parameters. NEVER enabled in a production build — only `passman-core`'s
+# dev-dependencies turn it on (resolver v2 keeps dev-dep features out of normal
+# builds). Production code calls `export`, which always enforces the Floor.
+test-util = []
+
 [dependencies]
 passman-crypto = { path = "../passman-crypto" }
 thiserror.workspace = true

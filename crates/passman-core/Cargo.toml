@@ -19,6 +19,11 @@ thiserror.workspace = true
 
 [dev-dependencies]
 passman-hsm = { path = "../passman-hsm", features = ["mock"] }
+# test-util exposes passman_recovery::export_unchecked so the integration tests
+# can build a cheap recovery file and exercise App::import_recovery end-to-end
+# without the 1 GiB recovery Floor. Dev-only (resolver v2 keeps it out of the
+# normal build); production never enables it.
+passman-recovery = { path = "../passman-recovery", features = ["test-util"] }
 tempfile.workspace = true
 # Test-only: the integration tests generate a valid TOTP code from the seed
 # decoded out of the provisioning URI (passman-totp exposes only verification,
