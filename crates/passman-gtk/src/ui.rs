@@ -17,7 +17,7 @@ use gtk::prelude::*;
 use gtk::{glib, Align, Application, ApplicationWindow, Orientation};
 
 use passman_core::{App, EntryHandle, RevealField};
-use passman_crypto::SecretString;
+use passman_crypto::{KdfParams, SecretString};
 use passman_hsm::linux::{select_linux_backend, LinuxKeyStore};
 use passman_platform::{Paths, Settings};
 use passman_policy::{generate, Charset, GenerationRequest, RequiredClasses};
@@ -91,7 +91,7 @@ pub fn run() -> anyhow::Result<ExitCode> {
     }
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let vault_exists = paths.vault().exists();
+    let vault_path = paths.vault().to_path_buf();
     let fact_overwrite = settings.clipboard_fact_overwrite;
     let (session, responses) = Session::spawn(
         app_core,
@@ -102,10 +102,10 @@ pub fn run() -> anyhow::Result<ExitCode> {
 
     let application = Application::builder().application_id(APP_ID).build();
     // The session + receiver are consumed on first activation.
-    let startup = Rc::new(RefCell::new(Some((session, responses, vault_exists))));
+    let startup = Rc::new(RefCell::new(Some((session, responses, vault_path))));
     application.connect_activate(move |app| {
-        if let Some((session, responses, vault_exists)) = startup.borrow_mut().take() {
-            build_ui(app, session, responses, vault_exists);
+        if let Some((session, responses, vault_path)) = startup.borrow_mut().take() {
+            build_ui(app, session, responses, vault_path);
         }
     });
 
@@ -124,6 +124,8 @@ struct Ui {
     master: gtk::PasswordEntry,
     totp: gtk::Entry,
     unlock_btn: gtk::Button,
+    create_btn: gtk::Button,
+    unlock_hint: gtk::Label,
     unlock_spinner: gtk::Spinner,
     unlock_error: gtk::Label,
     list: gtk::ListBox,
@@ -135,6 +137,7 @@ struct Ui {
     add_url: gtk::Entry,
     add_notes: gtk::Entry,
     session: Session,
+    vault_path: PathBuf,
     entries: RefCell<Vec<EntryHandle>>,
     selected: RefCell<Option<usize>>,
 }
@@ -144,6 +147,22 @@ impl Ui {
     fn selected_id(&self) -> Option<EntryId> {
         let idx = (*self.selected.borrow())?;
         self.entries.borrow().get(idx).map(|h| h.id)
+    }
+
+    /// Show the unlock controls when a vault exists, else the create controls.
+    fn refresh_gate(&self) {
+        let exists = self.vault_path.exists();
+        self.totp.set_visible(exists);
+        self.unlock_btn.set_visible(exists);
+        self.create_btn.set_visible(!exists);
+        self.unlock_hint.set_text(if exists {
+            "Unlock your vault."
+        } else {
+            "Welcome — choose a master password to create your vault."
+        });
+        self.master.set_text("");
+        self.totp.set_text("");
+        self.unlock_error.set_text("");
     }
 
     /// Rebuild the entry list box from `entries`.
@@ -169,7 +188,8 @@ impl Ui {
 
 /// Build the window and all wiring.
 #[allow(clippy::too_many_lines)] // cohesive widget construction; splitting hurts clarity
-fn build_ui(app: &Application, session: Session, responses: Receiver<Response>, vault_exists: bool) {
+fn build_ui(app: &Application, session: Session, responses: Receiver<Response>, vault_path: PathBuf) {
+    let vault_exists = vault_path.exists();
     let stack = gtk::Stack::new();
     stack.set_transition_type(gtk::StackTransitionType::SlideLeftRight);
 
@@ -184,6 +204,8 @@ fn build_ui(app: &Application, session: Session, responses: Receiver<Response>, 
         .build();
     let unlock_btn = gtk::Button::with_label("Unlock");
     unlock_btn.add_css_class("suggested-action");
+    let create_btn = gtk::Button::with_label("Create vault");
+    create_btn.add_css_class("suggested-action");
     let unlock_spinner = gtk::Spinner::new();
     let unlock_error = gtk::Label::builder()
         .label("")
@@ -193,8 +215,12 @@ fn build_ui(app: &Application, session: Session, responses: Receiver<Response>, 
     let unlock_hint = gtk::Label::new(Some(if vault_exists {
         "Unlock your vault."
     } else {
-        "No vault found. Create one with the CLI: `passman init`."
+        "Welcome — choose a master password to create your vault."
     }));
+    // Show create-vs-unlock controls depending on whether a vault exists.
+    totp.set_visible(vault_exists);
+    unlock_btn.set_visible(vault_exists);
+    create_btn.set_visible(!vault_exists);
 
     let unlock_box = gtk::Box::new(Orientation::Vertical, 10);
     unlock_box.set_margin_top(24);
@@ -209,6 +235,7 @@ fn build_ui(app: &Application, session: Session, responses: Receiver<Response>, 
     unlock_box.append(&master);
     unlock_box.append(&totp);
     unlock_box.append(&unlock_btn);
+    unlock_box.append(&create_btn);
     unlock_box.append(&unlock_spinner);
     unlock_box.append(&unlock_error);
     stack.add_named(&unlock_box, Some("unlock"));
@@ -304,6 +331,8 @@ fn build_ui(app: &Application, session: Session, responses: Receiver<Response>, 
         master,
         totp,
         unlock_btn: unlock_btn.clone(),
+        create_btn: create_btn.clone(),
+        unlock_hint,
         unlock_spinner,
         unlock_error,
         list: list.clone(),
@@ -315,11 +344,13 @@ fn build_ui(app: &Application, session: Session, responses: Receiver<Response>, 
         add_url,
         add_notes,
         session,
+        vault_path,
         entries: RefCell::new(Vec::new()),
         selected: RefCell::new(None),
     });
 
     wire_unlock(&ui, &unlock_btn);
+    wire_create(&ui, &create_btn);
     wire_list_selection(&ui, &list);
     wire_vault_actions(&ui, &reveal_btn, &copy_pw_btn, &copy_user_btn, &remove_btn, &lock_btn, &add_btn);
     wire_add_page(&ui, &gen_btn, &save_btn, &cancel_btn);
@@ -337,6 +368,24 @@ fn wire_unlock(ui: &Rc<Ui>, unlock_btn: &gtk::Button) {
         ui.unlock_spinner.set_spinning(true);
         ui.unlock_btn.set_sensitive(false);
         ui.session.send(Request::Unlock { master, code });
+    });
+}
+
+fn wire_create(ui: &Rc<Ui>, create_btn: &gtk::Button) {
+    let ui = Rc::clone(ui);
+    create_btn.connect_clicked(move |_| {
+        let master = SecretString::new(ui.master.text().to_string());
+        if master.expose().is_empty() {
+            ui.unlock_error.set_text("Choose a master password first.");
+            return;
+        }
+        ui.unlock_error.set_text("");
+        ui.unlock_spinner.set_spinning(true);
+        ui.create_btn.set_sensitive(false);
+        ui.session.send(Request::Create {
+            master,
+            kdf: KdfParams::MEDIUM,
+        });
     });
 }
 
@@ -465,13 +514,25 @@ fn attach_response_poll(ui: &Rc<Ui>, responses: Receiver<Response>) {
 
 fn handle_response(ui: &Rc<Ui>, response: Response) {
     match response {
-        // The desktop app does not create vaults in-app (use the CLI), but the
-        // shared actor can; treat a create like an unlock if it ever arrives.
-        Response::Created { entries, .. } => {
+        Response::Created {
+            entries,
+            provisioning_uri,
+        } => {
+            ui.unlock_spinner.set_spinning(false);
+            ui.create_btn.set_sensitive(true);
+            ui.master.set_text("");
             ui.set_entries(entries);
+            // Show the one-time TOTP secret so the user can add it to their
+            // authenticator app. It is sensitive (it embeds the seed); selectable
+            // so the user can copy the otpauth:// URI.
+            ui.reveal.set_text(provisioning_uri.expose());
+            ui.status
+                .set_text("Vault created. Add this TOTP secret to your authenticator now — it is shown only once.");
             ui.stack.set_visible_child_name("vault");
         }
         Response::CreateFailed { message } => {
+            ui.unlock_spinner.set_spinning(false);
+            ui.create_btn.set_sensitive(true);
             ui.unlock_error.set_text(&message);
         }
         Response::Unlocked { entries } => {
@@ -517,6 +578,8 @@ fn handle_response(ui: &Rc<Ui>, response: Response) {
         Response::Locked => {
             ui.set_entries(Vec::new());
             ui.status.set_text("");
+            // A vault may have just been created; re-evaluate create-vs-unlock.
+            ui.refresh_gate();
             ui.stack.set_visible_child_name("unlock");
         }
         Response::Error { message } => {

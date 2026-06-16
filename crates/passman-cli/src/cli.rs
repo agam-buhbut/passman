@@ -10,14 +10,21 @@ use passman_vault::EntryRecord;
 
 /// Local-only, hardware-backed password manager.
 #[derive(Debug, Parser)]
-#[command(name = "passman", version, about, long_about = None)]
+#[command(
+    name = "passman",
+    version,
+    about = "Local-only, hardware-backed password manager.\n\nYour vault is protected by your master password AND a key held in your device's \
+             hardware (a TPM), with a one-time TOTP code required at unlock. \
+             Nothing is sent over the network.",
+    long_about = None
+)]
 pub struct Cli {
-    /// Use the keyring (`SecretService`) fallback when no TPM is present. The
-    /// keyring has no hardware dictionary-attack lockout — weaker (§6.2).
+    /// Fall back to the OS keyring when this device has no usable TPM.
+    /// (Weaker: the keyring has no hardware lockout against guessing.)
     #[arg(long, global = true)]
     pub allow_software_hsm: bool,
 
-    /// Override the vault directory (default: the per-platform location, §1.5).
+    /// Use a custom vault directory instead of the default location.
     #[arg(long, global = true, value_name = "DIR")]
     pub vault_dir: Option<PathBuf>,
 
@@ -76,11 +83,12 @@ pub enum Command {
         length: Option<u16>,
     },
 
-    /// Write an encrypted single-factor recovery export.
+    /// Write an encrypted backup file you can restore from with just your
+    /// master password (no hardware key needed).
     Export {
         /// Output file path.
         file: PathBuf,
-        /// Recovery Argon2id preset (Floor is the minimum the format allows).
+        /// Backup strength (higher = slower to open, harder to crack).
         #[arg(long, value_enum, default_value_t = RecPreset::Floor)]
         preset: RecPreset,
     },

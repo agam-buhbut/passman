@@ -51,6 +51,8 @@ dependencies {
     // UniFFI's generated Kotlin uses JNA; the @aar variant ships the JNA native
     // libs for the Android ABIs.
     implementation("net.java.dev.jna:jna:5.14.0@aar")
+    // QR encoding for the TOTP provisioning URI.
+    implementation("com.google.zxing:core:3.5.3")
 
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")

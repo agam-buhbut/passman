@@ -341,3 +341,37 @@ fn lock_returns_to_locked_state() {
     session.send(Request::Lock);
     assert!(matches!(recv(&rx), Response::Locked));
 }
+
+#[test]
+fn create_makes_a_vault_and_returns_the_provisioning_uri() {
+    // The in-app create path (used by the GTK and Android shells): a fresh,
+    // vault-less directory, then a Create request.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("vault.pmv");
+    let backend = SharedMock::new();
+    let clock = TestClock::at(1_700_000_000);
+    let app = App::open_allowing_software_hsm(&path, backend, clock as Arc<dyn Clock>)
+        .expect("open");
+    let clip = SharedClipboard::default();
+    let (session, rx) = Session::spawn(
+        app,
+        move || Ok(clip),
+        Box::new(MockPrompter::authenticating()),
+        true,
+    );
+    session.send(Request::Create {
+        master: master(),
+        kdf: FAST_KDF,
+    });
+    match recv(&rx) {
+        Response::Created {
+            entries,
+            provisioning_uri,
+        } => {
+            assert!(entries.is_empty(), "a new vault is empty");
+            assert!(provisioning_uri.expose().starts_with("otpauth://"));
+        }
+        other => panic!("expected Created, got {other:?}"),
+    }
+    assert!(path.exists(), "the vault file was written");
+}

@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
@@ -168,7 +169,17 @@ private fun VaultScreen(
             Button(onLock) { Text("Lock") }
         }
         if (revealed.isNotEmpty()) {
-            Card(Modifier.fillMaxWidth()) { Text(revealed, Modifier.padding(12.dp)) }
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (revealed.startsWith("otpauth://")) {
+                        Text("Scan with your authenticator app (shown once):")
+                        QrCode(revealed, Modifier.size(220.dp))
+                        Text(revealed, style = MaterialTheme.typography.bodySmall)
+                    } else {
+                        Text(revealed)
+                    }
+                }
+            }
         }
         LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
             items(entries) { item ->
