@@ -41,3 +41,10 @@ Thumbs.db
 cargocheck.*
 /crates/passman-uniffi/bindings/
 /crates/passman-uniffi/jniLibs/
+android/local.properties
+android/.gradle/
+android/build/
+android/app/build/
+android/app/src/main/jniLibs/
+android/app/src/main/kotlin/uniffi/
+android/.kotlin/

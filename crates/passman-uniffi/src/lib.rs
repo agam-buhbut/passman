@@ -338,19 +338,22 @@ impl From<EntryHandle> for EntryItem {
 }
 
 /// Errors surfaced to the Kotlin side from [`PassmanApp`] methods.
+///
+/// The message field is named `detail` (not `message`) so the generated Kotlin
+/// exception subclasses do not clash with `Throwable.message`.
 #[derive(Debug, Clone, uniffi::Error, thiserror::Error)]
 pub enum AppError {
     /// The vault could not be opened (e.g. already in use, or no hardware).
-    #[error("{message}")]
+    #[error("{detail}")]
     Setup {
-        /// User-facing message.
-        message: String,
+        /// User-facing detail.
+        detail: String,
     },
     /// An operation failed (bad credentials, missing entry, …).
-    #[error("{message}")]
+    #[error("{detail}")]
     Failed {
-        /// User-facing message.
-        message: String,
+        /// User-facing detail.
+        detail: String,
     },
     /// The session is locked (expired or never unlocked); unlock again.
     #[error("the session is locked")]
@@ -390,7 +393,7 @@ impl PassmanApp {
         let backend = AndroidKeyStore::new(Arc::new(KeystoreAdapter(keystore)));
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let app = App::open(&vault_path, backend, clock).map_err(|e| AppError::Setup {
-            message: format!("could not open the vault: {e}"),
+            detail: format!("could not open the vault: {e}"),
         })?;
         let (session, responses) = Session::spawn(
             app,
@@ -417,7 +420,7 @@ impl PassmanApp {
             Response::Created {
                 provisioning_uri, ..
             } => Ok(provisioning_uri.expose().to_owned()),
-            Response::CreateFailed { message } => Err(AppError::Failed { message }),
+            Response::CreateFailed { message } => Err(AppError::Failed { detail: message }),
             other => Err(unexpected(&other)),
         }
     }
@@ -433,7 +436,7 @@ impl PassmanApp {
             code,
         }) {
             Response::Unlocked { entries } => Ok(entries.into_iter().map(EntryItem::from).collect()),
-            Response::UnlockFailed { message } => Err(AppError::Failed { message }),
+            Response::UnlockFailed { message } => Err(AppError::Failed { detail: message }),
             other => Err(unexpected(&other)),
         }
     }
@@ -460,7 +463,7 @@ impl PassmanApp {
         }) {
             Response::Revealed { value, .. } => Ok(value.expose().to_owned()),
             Response::Locked => Err(AppError::SessionLocked),
-            Response::Error { message } => Err(AppError::Failed { message }),
+            Response::Error { message } => Err(AppError::Failed { detail: message }),
             other => Err(unexpected(&other)),
         }
     }
@@ -479,7 +482,7 @@ impl PassmanApp {
         }) {
             Response::Copied { cookie } => Ok(cookie.digest().to_vec()),
             Response::Locked => Err(AppError::SessionLocked),
-            Response::Error { message } => Err(AppError::Failed { message }),
+            Response::Error { message } => Err(AppError::Failed { detail: message }),
             other => Err(unexpected(&other)),
         }
     }
@@ -536,7 +539,7 @@ impl PassmanApp {
         match self.call(Request::Generate { length }) {
             Response::Generated { password } => Ok(password.expose().to_owned()),
             Response::Locked => Err(AppError::SessionLocked),
-            Response::Error { message } => Err(AppError::Failed { message }),
+            Response::Error { message } => Err(AppError::Failed { detail: message }),
             other => Err(unexpected(&other)),
         }
     }
@@ -562,7 +565,7 @@ impl PassmanApp {
         match self.call(request) {
             Response::Entries { entries } => Ok(entries.into_iter().map(EntryItem::from).collect()),
             Response::Locked => Err(AppError::SessionLocked),
-            Response::Error { message } => Err(AppError::Failed { message }),
+            Response::Error { message } => Err(AppError::Failed { detail: message }),
             other => Err(unexpected(&other)),
         }
     }
@@ -571,7 +574,7 @@ impl PassmanApp {
 /// Map a 16-byte slice to an [`EntryId`].
 fn entry_id(bytes: &[u8]) -> Result<EntryId, AppError> {
     let arr = <[u8; ENTRY_ID_LEN]>::try_from(bytes).map_err(|_| AppError::Failed {
-        message: "invalid entry id".to_owned(),
+        detail: "invalid entry id".to_owned(),
     })?;
     Ok(EntryId::from_bytes(arr))
 }
@@ -582,7 +585,7 @@ fn unexpected(response: &Response) -> AppError {
         AppError::SessionLocked
     } else {
         AppError::Failed {
-            message: "unexpected internal response".to_owned(),
+            detail: "unexpected internal response".to_owned(),
         }
     }
 }
