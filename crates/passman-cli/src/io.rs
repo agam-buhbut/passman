@@ -50,9 +50,29 @@ pub struct TerminalIo;
 
 impl Io for TerminalIo {
     fn read_secret(&mut self, prompt: &str) -> io::Result<SecretString> {
-        // `rpassword` reads from the tty with echo disabled.
-        let secret = rpassword::prompt_password(prompt)?;
-        Ok(SecretString::new(secret))
+        use std::io::IsTerminal;
+        // Prompt on stderr, then read the secret from stdin. Interactively, use
+        // `rpassword` to read with echo disabled; under piped/scripted input
+        // there is no tty to control, so read a plain line (the pre-tty
+        // `prompt_password`/`read_password` paths fail with ENXIO when no
+        // controlling terminal exists).
+        eprint!("{prompt}");
+        io::stderr().flush()?;
+        let stdin = io::stdin();
+        if stdin.is_terminal() {
+            Ok(SecretString::new(rpassword::read_password()?))
+        } else {
+            let mut line = String::new();
+            if stdin.lock().read_line(&mut line)? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "unexpected end of input",
+                ));
+            }
+            Ok(SecretString::new(
+                line.trim_end_matches(['\n', '\r']).to_owned(),
+            ))
+        }
     }
 
     fn read_line(&mut self, prompt: &str) -> io::Result<String> {
