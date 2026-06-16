@@ -21,7 +21,8 @@ use hmac::{Hmac, Mac};
 use sha1::Sha1;
 
 use passman_core::{
-    App, ClearOutcome, Clipboard, ClipboardCookie, CoreError, RevealField, UnlockError,
+    App, ClearOutcome, Clipboard, ClipboardCookie, CoreError, Progress, ProgressError, RevealField,
+    UnlockError,
 };
 use passman_crypto::SecretBytes;
 use passman_crypto::{KdfParams, SecretString};
@@ -993,4 +994,77 @@ fn hsm_native_lockout_blocks_unlock_before_any_prompt() {
         }
         other => panic!("expected LockedOut, got {other:?}"),
     }
+}
+
+/// Shared counters a [`CountingProgress`] writes to, readable from the test.
+#[derive(Default)]
+struct ProgressCounts {
+    starts: AtomicU64,
+    ends: AtomicU64,
+    last_label: Mutex<Option<String>>,
+}
+
+/// A [`Progress`] that counts `start`/`end` calls and records the last label.
+struct CountingProgress(Arc<ProgressCounts>);
+
+impl Progress for CountingProgress {
+    fn start(&self, label: String) -> Result<(), ProgressError> {
+        self.0.starts.fetch_add(1, Ordering::SeqCst);
+        *self.0.last_label.lock().expect("label lock") = Some(label);
+        Ok(())
+    }
+
+    fn end(&self) -> Result<(), ProgressError> {
+        self.0.ends.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[test]
+fn progress_brackets_each_argon2_operation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clock = TestClock::at(16_000_000);
+    let path = dir.path().join("vault.pmv");
+    let counts = Arc::new(ProgressCounts::default());
+
+    let app = App::open_allowing_software_hsm(
+        path,
+        MockKeyStore::new(),
+        clock.clone() as Arc<dyn Clock>,
+    )
+    .expect("open")
+    .with_progress(Arc::new(CountingProgress(counts.clone())));
+    let prompter = MockPrompter::authenticating();
+
+    // create_vault runs one Argon2id derivation → one balanced start/end.
+    let (unlocked, uri) = app
+        .create_vault(
+            &pw("Str0ng-Master-P@ssphrase!"),
+            FAST_KDF,
+            TotpConfig::default(),
+            &(),
+            &prompter,
+        )
+        .expect("create");
+    let seed = seed_from_uri(uri.expose());
+    unlocked.lock();
+    assert_eq!(counts.starts.load(Ordering::SeqCst), 1, "create: one start");
+    assert_eq!(counts.ends.load(Ordering::SeqCst), 1, "create: one end");
+
+    // unlock runs another derivation → a second balanced bracket.
+    let code = valid_code(&seed, clock.now_secs());
+    let unlocked = app
+        .unlock(&pw("Str0ng-Master-P@ssphrase!"), &code, &(), &prompter)
+        .expect("unlock");
+    assert_eq!(counts.starts.load(Ordering::SeqCst), 2, "unlock: second start");
+    assert_eq!(counts.ends.load(Ordering::SeqCst), 2, "unlock: second end");
+    assert_eq!(
+        counts
+            .last_label
+            .lock()
+            .expect("label lock")
+            .as_deref(),
+        Some("Deriving vault key"),
+    );
+    unlocked.lock();
 }

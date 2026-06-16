@@ -21,6 +21,7 @@ use passman_vault::{EntryId, EntryRecord, Index, IndexEntry, Vault};
 use crate::app::{App, KEY_LEN};
 use crate::clipboard::{random_fact, ClearOutcome, Clipboard, ClipboardCookie};
 use crate::error::CoreError;
+use crate::progress::ProgressGuard;
 use crate::session::SessionToken;
 
 /// Seconds the session is clamped to after a copy/reveal (`architecture.md`
@@ -343,6 +344,10 @@ impl<'a, H: passman_hsm::HardwareKeyStore> UnlockedApp<'a, H> {
             self.app
                 .unwrap_slot_core(HsmSlot::VaultKey, vault.k_hsm_wrap_blob(), ctx, prompter)?;
 
+        // Bracket both Argon2id derivations (verify old + derive new) plus the
+        // full re-encrypt for the progress UI (§2.5).
+        let _pg = ProgressGuard::start(self.app.progress(), "Changing master password");
+
         // Verify the OLD password derives the current K_master (probe).
         let old_master = crate::app::derive_master_from_bytes(
             old,
@@ -409,6 +414,11 @@ impl<'a, H: passman_hsm::HardwareKeyStore> UnlockedApp<'a, H> {
         if !classify(entropy.bits).allows_export() {
             return Err(CoreError::WeakPasswordForExport);
         }
+
+        // Bracket the heavy section: the re-auth Argon2id and, dominantly, the
+        // aggressive recovery-export Argon2id (≥1 GiB Floor) — one indeterminate
+        // progress span for the shell (§2.5).
+        let _pg = ProgressGuard::start(self.app.progress(), "Creating recovery export");
 
         // Fresh re-auth, independent of the session token: unwrap both slots,
         // verify TOTP against S, derive K_master from the supplied master, and

@@ -21,6 +21,7 @@ use passman_vault::{Vault, VaultMetadata};
 
 use crate::error::{CoreError, UnlockError};
 use crate::lockout::LockoutState;
+use crate::progress::{NoProgress, Progress, ProgressGuard};
 use crate::provisioning::build_provisioning_uri;
 use crate::session::SessionToken;
 use crate::unlocked::UnlockedApp;
@@ -60,6 +61,9 @@ pub struct App<H: HardwareKeyStore> {
     backend: H,
     /// The project clock (the `passman-totp` `Clock`, reused per the design).
     clock: Arc<dyn Clock>,
+    /// The progress sink for long Argon2id operations (§2.5). Defaults to
+    /// [`NoProgress`]; a shell injects a real one via [`App::with_progress`].
+    progress: Arc<dyn Progress>,
     /// The single-instance advisory lock, held for the `App`'s lifetime (D27).
     _lock: crate::storage::InstanceLock,
     /// Whether a software-mock backend is permitted (the `--allow-software-hsm`
@@ -98,11 +102,25 @@ impl<H: HardwareKeyStore> App<H> {
             vault_path,
             backend,
             clock,
+            progress: Arc::new(NoProgress),
             _lock: lock,
             allow_software_hsm: false,
             totp_config: Mutex::new(TotpConfig::default()),
             verifier: Mutex::new(None),
         })
+    }
+
+    /// Inject a [`Progress`] sink for the long Argon2id operations (`unlock`,
+    /// `create_vault`, recovery import/export, master-password change — §2.5).
+    ///
+    /// Builder-style so it composes with either constructor without a
+    /// combinatorial set of `*_with_progress` variants. A desktop/mobile shell
+    /// calls this once after `open`; tests and headless callers omit it and get
+    /// the no-op [`NoProgress`] default.
+    #[must_use]
+    pub fn with_progress(mut self, progress: Arc<dyn Progress>) -> Self {
+        self.progress = progress;
+        self
     }
 
     /// Like [`App::open`], but permits a software-mock HSM backend (the
@@ -173,9 +191,13 @@ impl<H: HardwareKeyStore> App<H> {
         let k_hsm_blob = self.enroll_slot(HsmSlot::VaultKey, &k_hsm, ctx, prompter)?;
         let seed_blob = self.enroll_slot(HsmSlot::TotpSeed, &seed, ctx, prompter)?;
 
-        // Derive K_master from K_pw ‖ K_hsm.
+        // Derive K_master from K_pw ‖ K_hsm. Bracket the multi-second Argon2id
+        // so the shell can show an indeterminate progress bar (§2.5).
         let vault_salt: [u8; KEY_LEN] = *random_secret::<KEY_LEN>().expose();
-        let k_master = derive_master(password, &vault_salt, &kdf, &k_hsm)?;
+        let k_master = {
+            let _pg = ProgressGuard::start(&self.progress, "Deriving vault key");
+            derive_master(password, &vault_salt, &kdf, &k_hsm)?
+        };
 
         // Build and persist the vault.
         let metadata = VaultMetadata::new(self.now_unix_secs());
@@ -269,10 +291,14 @@ impl<H: HardwareKeyStore> App<H> {
         }
 
         // Step 5: derive K_master = HKDF(K_pw ‖ K_hsm). `k_hsm` is the raw
-        // unwrapped bytes; the helper validates its length.
-        let k_master =
+        // unwrapped bytes; the helper validates its length. The Argon2id work is
+        // the multi-second part of unlock, so bracket it for the progress UI
+        // (§2.5).
+        let k_master = {
+            let _pg = ProgressGuard::start(&self.progress, "Deriving vault key");
             derive_master_from_bytes(password, vault.vault_salt(), &vault.kdf_params(), &k_hsm)
-                .map_err(|_| UnlockError::BadCredentials)?;
+                .map_err(|_| UnlockError::BadCredentials)?
+        };
 
         // Step 6: verify the probe. A wrong password (or tampered probe-AD
         // header field) fails here and counts as an advisory failure.
@@ -336,6 +362,11 @@ impl<H: HardwareKeyStore> App<H> {
         prompter: &dyn BiometricPrompter,
     ) -> Result<(UnlockedApp<'_, H>, ProvisioningUri), CoreError> {
         self.check_backend_allowed()?;
+
+        // Bracket the whole import: it runs the heavy recovery-KDF Argon2id
+        // (decrypt) and then the vault-KDF Argon2id (re-derive), so the shell
+        // shows one indeterminate progress span across both (§2.5).
+        let _pg = ProgressGuard::start(&self.progress, "Importing recovery");
 
         // Decrypt + parse the recovery payload.
         let payload = passman_recovery::import(recovery_file, password)?;
@@ -494,6 +525,12 @@ impl<H: HardwareKeyStore> App<H> {
     /// The project clock.
     pub(crate) fn clock(&self) -> &Arc<dyn Clock> {
         &self.clock
+    }
+
+    /// The progress sink, for unlocked-side long operations (export, password
+    /// change) to bracket their Argon2id work.
+    pub(crate) fn progress(&self) -> &Arc<dyn Progress> {
+        &self.progress
     }
 
     /// The vault path (for read/write by unlocked operations).

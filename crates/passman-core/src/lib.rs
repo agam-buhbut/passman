@@ -20,6 +20,8 @@
 //!   and [`UnlockedApp::export_recovery`].
 //! - [`Clipboard`] / [`ClipboardCookie`] / [`ClearOutcome`] / [`FACTS`] — the
 //!   clipboard contract (§5.3).
+//! - [`Progress`] / [`NoProgress`] — the long-operation progress contract
+//!   (§2.5), injected via [`App::with_progress`].
 //! - [`SessionToken`], [`EntryHandle`], [`RevealField`], [`ProvisioningUri`].
 //! - [`CoreError`] / [`UnlockError`] — the error taxonomy.
 //!
@@ -31,6 +33,7 @@ mod app;
 mod clipboard;
 mod error;
 mod lockout;
+mod progress;
 mod provisioning;
 mod session;
 mod storage;
@@ -40,6 +43,7 @@ pub use app::{App, ProvisioningUri};
 pub use clipboard::{ClearOutcome, Clipboard, ClipboardCookie, FACTS};
 pub use error::{CoreError, UnlockError};
 pub use lockout::{lockout_minutes, LockoutState};
+pub use progress::{NoProgress, Progress, ProgressError};
 pub use session::SessionToken;
 pub use storage::{atomic_write, read, InstanceLock};
 pub use unlocked::{EntryHandle, PasswordChangeOutcome, RevealField, UnlockedApp};
