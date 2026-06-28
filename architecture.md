@@ -328,6 +328,10 @@ Parsing rules: read exactly `entries_count` envelopes; EOF-before-count or trail
 
 `p = 1` deliberately: memory cost is the real GPU/ASIC barrier; raising `p` mostly helps the attacker too.
 
+**Mobile default — Low.** The Android front-end defaults vault creation to the **Low** preset (256 MiB / t = 4), labelled "Low (recommended)" in the create screen, because phones cannot spare the 1 GiB the desktop Medium default uses without OOM risk. Desktop (CLI/GTK) still defaults to Medium.
+
+**Anti-DoS ceiling (untrusted-header guard).** Argon2 cost parameters reach `passman-crypto` from attacker-controllable on-disk headers (vault and recovery files), and the `argon2` crate itself caps `m`/`t` only near `u32::MAX`. A hostile header could therefore demand a multi-terabyte allocation or multi-hour derivation **before** authentication can fail — a pre-auth resource-exhaustion DoS (fatal on mobile). `passman-crypto` defines a universal *ceiling* — `MAX_M_KIB = 8 GiB`, `MAX_T = 24`, `MAX_P = 16` — enforced by `KdfParams::within_limits()` at **both** parser boundaries (`vault::from_bytes`, `recovery::import`) and again inside the derivation as a backstop, so no path can run an out-of-range cost. The ceiling sits at the strongest shipped preset (recovery "Paranoid" = 8 GiB / t = 12), so every legitimate configuration is still admitted. This is a **ceiling**, not a floor: the per-context strength *floor* (the recovery export floor in §7.4) is a separate, export-side caller policy.
+
 ### 4.9 Lockout: HSM-native primary, app-timer advisory
 
 The **security control is the platform HSM's own dictionary-attack protection** — TPM 2.0 DA lockout, Android Keystore auth-bound key attempt limits, Windows NCrypt anti-hammering. These enforce state an attacker who holds `K_hsm` cannot rewrite, which is the only kind of rate-limit that binds a post-unwrap attacker. `HsmCapabilities` (§6.1) surfaces `max_attempts_before_lockout` and `lockout_recovery` so the UI can explain platform behavior.
@@ -701,15 +705,27 @@ Ship **both**; document **minisign as primary**. minisign (Ed25519): tiny verifi
 
 APK Signature Scheme v3 (installer requirement; cert fingerprint published for TOFU+pinning) **plus** detached minisign+GPG over the `.apk` (download verification).
 
-### 9.4 Reproducible builds — scoped to the core
+### 9.4 Reproducible builds — scoped to the core, under a fixed toolchain + environment
 
-**Guaranteed reproducible:** the core Rust binary/library, via pinned `rust-toolchain.toml`, committed `Cargo.lock`, `--remap-path-prefix` (covering the project dir **and** `$CARGO_HOME`/registry **and** `$RUSTUP_HOME`), `SOURCE_DATE_EPOCH`, fixed `RUSTFLAGS`, **`codegen-units = 1`** in the release profile (without this, codegen partitioning is nondeterministic), vendored deps, `cargo auditable`, and a pinned build-container image digest. Proc-macro-driven nondeterminism (e.g. `HashMap`-iteration-order in a macro) is mitigated by minimizing proc-macro deps and verified empirically by the CI rebuild-twice-compare job. A `reproduce.sh` + expected hash is published.
+**What exists today.** `reproduce.sh` is a plain `cargo build --release --locked -p passman-cli` wrapped in the determinism controls that *are* implemented:
 
-**Not guaranteed:** `.deb`/`.exe`/`.apk` wrappers and system-library linkage variance. Windows reproducibility targets the GNU toolchain. The boundary is documented so a `.deb` hash match is not over-trusted.
+- pinned `rust-toolchain.toml` (channel `1.95.0`) → the exact compiler;
+- committed `Cargo.lock` + `--locked` → the exact dependency versions;
+- `--remap-path-prefix` covering the project dir **and** `$CARGO_HOME`/registry **and** `$RUSTUP_HOME` → no machine-specific absolute paths in the binary;
+- `SOURCE_DATE_EPOCH` → a fixed build timestamp;
+- **`codegen-units = 1`** in `[profile.release]` (without this, codegen partitioning is nondeterministic).
+
+The CI `build-twice` job checks the repo out twice and compares the two SHA-256 hashes, so determinism is verified empirically on each push.
+
+**Scope of the guarantee — same toolchain *and* environment.** With the same pinned toolchain, the same `Cargo.lock`, and the same build environment (in particular the same `libtss2`/`libdbus` system libraries and linker, which the CLI links dynamically), `reproduce.sh` yields a byte-identical `target/release/passman`. This is **not** a cross-machine "any host, same hash" claim: differing system libraries or a different linker can change the output. The `build-twice` job exercises exactly this same-environment case.
+
+**Not yet implemented (PLANNED).** Vendored dependencies (`cargo vendor`), `cargo auditable` metadata embedding, and a pinned build-container image digest are *not* in the tree today. They are the path to a stronger, host-independent reproducibility guarantee and are tracked as future work — they are intentionally not claimed as current behaviour.
+
+**Explicitly not guaranteed:** `.deb`/`.exe`/`.apk` wrappers and cross-environment system-library linkage variance. Windows reproducibility targets the GNU toolchain. The boundary is documented so a wrapper-hash match is not over-trusted.
 
 ### 9.5 Supply-chain CI
 
-`cargo audit` (RUSTSEC) + `cargo deny` (license/banned/duplicates) + boundary greps (§2.4) + parser fuzzing gate merges; reproducibility job gates release tags. Minimal dependency surface (every crate justified in `DEPENDENCIES.md`); prefer RustCrypto over FFI; review third-party `build.rs`. CycloneDX SBOM published per release.
+`cargo audit` (RUSTSEC) + `cargo deny` (license/banned/duplicates) + boundary greps (§2.4) + parser fuzzing gate merges; the `build-twice` reproducibility job runs on every push (§9.4). Minimal dependency surface — every workspace dependency is justified in [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md); prefer RustCrypto over FFI; review third-party `build.rs`. A CycloneDX SBOM is generated at release time by the `cargo-cyclonedx` step in `.github/workflows/release.yml` and published alongside the artifacts.
 
 ### 9.6 Update mechanism — network-silent by default
 
@@ -740,7 +756,7 @@ No auto-update. The default binary makes **no network connections, ever**. An op
 | 5 | Screen recording / shoulder-surf | Medium | Obscured-by-default reveal; tap-to-show; 10 s auto-hide; `FLAG_SECURE` |
 | 6 | Cold-boot | Low | Accepted |
 | 7 | Spectre-class side-channel | Low | Constant-time primitives; broader µarch channels accepted |
-| 8 | Supply-chain dependency compromise | Critical | `cargo audit`/`deny`; vendored deps; minimal surface; SBOM; `build.rs` review |
+| 8 | Supply-chain dependency compromise | Critical | `cargo audit`/`deny`; minimal surface (justified in `docs/DEPENDENCIES.md`); per-release CycloneDX SBOM; `build.rs` review (vendored deps: planned, §9.4) |
 | 9 | Malicious update / MITM | Critical | Dual minisign+GPG; offline keys; no auto-update; signed manifest if enabled |
 | 10 | TOTP replay | Medium | Last-accepted-code cache (in-memory) + ±1 step skew only |
 | 11 | Vault tampering / corruption | High | AEAD tags; version + id in AD; probe AD binds header params; index↔envelope-set check; fail-closed (DoS-by-corruption accepted) |

@@ -58,6 +58,21 @@ $ passman gen --length 32      # generate a password (no vault needed)
 Run `passman --help` or `passman <command> --help` for everything else
 (`rm`, `export`, `import`, `passwd`, `--show`, `--field`, …).
 
+### Exit codes (for scripting)
+
+The CLI returns distinct status codes so scripts can branch on the failure kind
+(errors go to `stderr`; data to `stdout`):
+
+| Code | Meaning |
+|------|---------|
+| `0` | success |
+| `1` | general failure |
+| `2` | usage error (bad arguments; emitted by the argument parser) |
+| `3` | entry not found |
+| `4` | authentication failed (wrong master password or TOTP code) |
+| `5` | locked out (advisory rate-limit in effect) |
+| `6` | already running (another instance holds the vault lock) |
+
 ---
 
 ## Install / build
@@ -131,14 +146,25 @@ cd android && ./gradlew :app:assembleDebug     # or: gradle :app:assembleDebug
 ```
 
 The phone app stores its vault in app-private storage and shows the TOTP setup
-as a **scannable QR code** on vault creation.
+as a **scannable QR code** on vault creation. On phones the key-derivation
+strength defaults to the **Low** preset (256 MiB Argon2id, labelled "Low
+(recommended)") to stay within mobile memory limits; desktop defaults to Medium
+(1 GiB). All presets are bounded by an anti-DoS ceiling (see
+[`architecture.md`](architecture.md) §4.8).
 
 ---
 
 ## Verify your download
 
-Release artifacts are published with a signed checksum file. **minisign is the
-primary signature**; a GPG signature is also provided. Verify before installing:
+> **Planned — no signed release has been published yet.** There are currently no
+> public signing keys, no `SHA-256SUMS`, and no signed artifacts; you build from
+> source (above). The commands below are a **preview** of the intended
+> verification flow once the first signed release ships — they cannot succeed
+> today, and the key/identity below is a placeholder.
+
+The plan: release artifacts are published with a signed checksum file, with
+**minisign as the primary signature** and a GPG signature alongside. Verify
+before installing:
 
 ```console
 # 1. minisign (primary) — uses the published public key.
@@ -149,10 +175,13 @@ gpg --verify SHA-256SUMS.asc SHA-256SUMS
 sha256sum --check SHA-256SUMS
 ```
 
-The core binary is also **reproducible** — run `./reproduce.sh` and compare its
-SHA-256 to the published one. Full signing/verification details, key
-fingerprints, and the Android APK certificate pin are in
-[`docs/RELEASE.md`](docs/RELEASE.md).
+The core CLI binary is **reproducible under a fixed toolchain and build
+environment** — run `./reproduce.sh` to rebuild it and (once published) compare
+its SHA-256 to the release hash. Because the CLI links system `libtss2`/`libdbus`,
+the byte-for-byte match holds for the same toolchain + the same system libraries,
+not unconditionally across machines (see [`architecture.md`](architecture.md)
+§9.4). Full signing/verification details, key fingerprints, and the Android APK
+certificate pin are in [`docs/RELEASE.md`](docs/RELEASE.md).
 
 ---
 

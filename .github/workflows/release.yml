@@ -1,0 +1,94 @@
+name: Release
+
+# Tag-triggered release skeleton. Builds the Linux release artifacts (CLI + GTK),
+# emits a SHA-256SUMS checksum file and a CycloneDX SBOM, and uploads them as
+# workflow artifacts for the maintainer to sign AIR-GAPPED before publishing.
+#
+# Signing keys NEVER touch CI: minisign + GPG signing is a deliberate manual,
+# air-gapped step (architecture.md §9.2; docs/RELEASE.md §2). This workflow only
+# produces and uploads the unsigned artifacts + checksums; a CI compromise
+# therefore cannot forge a signed release (threat #30).
+on:
+  push:
+    tags:
+      - "v*"
+
+# Read-only: the workflow uploads to the run's artifacts, not to a published
+# GitHub Release (publishing happens after the manual air-gapped signing step).
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fixed build timestamp for the reproducible CLI build — matches the
+  # `build-twice` job in ci.yml and the published expected hash (§9.4).
+  # reproduce.sh honours this value.
+  SOURCE_DATE_EPOCH: "1700000000"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System libraries (gtk4, TPM2, dbus)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libtss2-dev libdbus-1-dev pkg-config
+
+      - name: Toolchain (pinned by rust-toolchain.toml)
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The CLI is built through the reproducible-build wrapper so its hash
+      # matches docs/RELEASE.md under the same toolchain + environment (§9.4).
+      # reproduce.sh prints the artifact SHA-256 to stdout.
+      - name: Build the CLI (reproducible)
+        run: ./reproduce.sh | tee reproduce-hash.txt
+
+      - name: Build the GTK desktop app
+        run: cargo build --release --locked -p passman-gtk
+
+      # CycloneDX SBOM (architecture.md §9.5, threat #8). Installed as a prebuilt
+      # binary, consistent with ci.yml's supply-chain tooling. Left unpinned here
+      # so the skeleton does not break on a stale patch; pin it once a version is
+      # chosen for the first real release.
+      - name: Install cargo-cyclonedx (prebuilt)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx
+
+      - name: Generate the CycloneDX SBOM
+        run: cargo cyclonedx --all --format json
+
+      - name: Collect artifacts, SBOM, and checksums
+        run: |
+          mkdir -p dist/sbom
+          cp target/release/passman dist/
+          cp target/release/passman-gtk dist/
+          cp reproduce-hash.txt dist/
+          # One CycloneDX document per workspace member (<crate>.cdx.json).
+          find . -name '*.cdx.json' -not -path './dist/*' -exec cp {} dist/sbom/ \;
+          cd dist
+          sha256sum passman passman-gtk > SHA-256SUMS
+          echo "=== SHA-256SUMS ===" && cat SHA-256SUMS
+
+      - name: Upload unsigned release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: passman-${{ github.ref_name }}-linux-x86_64
+          path: dist/
+          if-no-files-found: error
+
+      # Signing is intentionally NOT automated. Download the artifact above, then
+      # on an AIR-GAPPED machine (docs/RELEASE.md §2) run:
+      #   minisign -S -s passman-minisign.key -m SHA-256SUMS   # -> SHA-256SUMS.minisig
+      #   gpg --armor --detach-sign SHA-256SUMS                # -> SHA-256SUMS.asc
+      # then publish SHA-256SUMS{,.minisig,.asc} alongside the artifacts.
+      - name: Signing reminder (manual, air-gapped)
+        run: |
+          echo "Unsigned artifacts + SHA-256SUMS uploaded." >&2
+          echo "SIGN AIR-GAPPED before publishing (docs/RELEASE.md §2):" >&2
+          echo "  minisign -S -s passman-minisign.key -m SHA-256SUMS" >&2
+          echo "  gpg --armor --detach-sign SHA-256SUMS" >&2

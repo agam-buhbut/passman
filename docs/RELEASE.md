@@ -1,5 +1,15 @@
 # Release & signing runbook
 
+> **Status: PLANNED — no signed release has been published yet.**
+> No public signing keys, no `SHA-256SUMS`, and no signed artifacts exist at the
+> time of writing. The minisign public key, GPG identity, and Android certificate
+> fingerprint shown below are **placeholders**, and the verification commands
+> cannot succeed until a first signed release ships. Everything here is the
+> intended procedure, recorded so the pipeline is ready — not steps a downloader
+> can run today. The tag-triggered build/checksum skeleton lives in
+> [`.github/workflows/release.yml`](../.github/workflows/release.yml); the
+> air-gapped signing steps below are deliberately *not* automated.
+
 How a `passman` release is built, signed, and published so downloaders can verify
 it. This is the supply-chain boundary against a malicious binary or a compromised
 CI (`architecture.md` §9.2–9.5, threats #28–#30).
@@ -100,10 +110,18 @@ incomplete — do not install it.
 
 ## Boundary (be honest about what is guaranteed)
 
-- **Reproducible:** the core Rust binary (`reproduce.sh` + pinned toolchain +
-  `Cargo.lock` + `codegen-units=1` + path remaps). Two builds on different
-  machines yield the same hash.
-- **NOT bit-reproducible:** the `.deb`/`.exe`/`.apk` wrappers and anything whose
-  output depends on system-library versions (the CLI links system `libtss2` /
-  `libdbus`). This is an accepted §9.4 boundary, documented so a wrapper-hash
-  match is not over-trusted.
+- **Reproducible under a fixed toolchain *and* environment:** the core CLI binary
+  that `reproduce.sh` builds (`passman`), via the pinned toolchain +
+  `Cargo.lock`/`--locked` + `codegen-units=1` + path remaps + `SOURCE_DATE_EPOCH`
+  (architecture.md §9.4). The "same hash" promise is scoped to that environment:
+  same pinned toolchain, same `Cargo.lock`, **and** the same system libraries and
+  linker. The CLI links system `libtss2` / `libdbus` dynamically, so a different
+  `libtss2`/`libdbus` version or a different linker can change the bytes — this is
+  *not* an unconditional "any machine, same hash" claim. The CI `build-twice` job
+  verifies exactly this same-environment determinism on each push.
+- **NOT bit-reproducible:** the `.deb`/`.exe`/`.apk` wrappers, and the CLI binary
+  *across differing build environments* (different system-library versions or
+  linker). Cross-environment, host-independent reproducibility would require
+  vendored deps + a pinned build container — both **planned, not yet implemented**
+  (§9.4). This is an accepted boundary, documented so a wrapper-hash match is not
+  over-trusted.
