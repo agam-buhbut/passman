@@ -15,6 +15,10 @@ members = [
 ]
 
 [workspace.package]
+# Single source-of-truth version for the workspace. Crates opt in with
+# `version.workspace = true`; this pass only establishes the field (wiring each
+# crate manifest to it is deferred to avoid rippling into every manifest).
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.95"
 publish = false

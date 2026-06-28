@@ -49,9 +49,15 @@ android/app/src/main/jniLibs/
 android/app/src/main/kotlin/uniffi/
 android/.kotlin/
 
-# cargo-fuzz build artifacts (the fuzz harness Cargo.toml + fuzz_targets/ stay tracked)
+# cargo-fuzz build artifacts (the fuzz harness Cargo.toml + fuzz_targets/ +
+# the committed seed corpus/ stay tracked). The corpus dir is intentionally NOT
+# ignored: it ships a small seed corpus so libFuzzer starts from real inputs.
+# cargo-fuzz also writes newly-discovered inputs into corpus/ at runtime — those
+# appear as untracked and should not be committed (only meaningful seeds are).
 crates/*/fuzz/target/
-crates/*/fuzz/corpus/
 crates/*/fuzz/artifacts/
 crates/*/fuzz/coverage/
 crates/*/fuzz/Cargo.lock
+
+# ── Build artifacts: never commit APKs (release/debug) ─────────────────────
+*.apk

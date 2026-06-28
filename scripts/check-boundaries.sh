@@ -51,6 +51,44 @@ allowed[passman-gtk]="passman-crypto passman-totp passman-policy passman-vault p
 # foreign callbacks); it may depend on any library crate.
 allowed[passman-uniffi]="passman-crypto passman-totp passman-policy passman-vault passman-hsm passman-recovery passman-core passman-platform"
 
+# Shared edge check: is `$2` (a passman path-dep) allowed for crate `$1`?
+check_edge() {
+    local name="$1" d="$2"
+    if [ -z "${allowed[$name]+set}" ]; then
+        err "unknown crate '$name' is not in the boundary allowlist (update this script)"
+        return
+    fi
+    case " ${allowed[$name]} " in
+    *" $d "*) : ;;
+    *) err "$name depends on $d, not allowed by §2.2 (allowed: '${allowed[$name]}')" ;;
+    esac
+}
+
+# Primary check: derive the real dependency graph from `cargo metadata` (parsed
+# with jq). Unlike the awk heuristic below it sees EVERY normal-dependency form —
+# `[dependencies]`, the `[dependencies.foo]` sub-table, and
+# `[target.'cfg(...)'.dependencies]` (target-specific deps carry kind=null too).
+# Dev- and build-dependencies are exempt by design (kind "dev"/"build"), matching
+# the original. Guarded: if cargo/jq/metadata are unavailable we fall back to the
+# awk secondary signal alone rather than failing the whole check spuriously.
+if command -v cargo >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 \
+    && meta=$(cargo metadata --no-deps --format-version 1 2>/dev/null); then
+    while read -r name d; do
+        [ -n "$name" ] || continue
+        check_edge "$name" "$d"
+    done < <(printf '%s' "$meta" | jq -r '
+        .packages[]
+        | .name as $n
+        | .dependencies[]
+        | select(.path != null and .kind == null and (.name | startswith("passman-")))
+        | "\($n) \(.name)"')
+else
+    echo "NOTE: cargo metadata / jq unavailable — relying on the awk heuristic only." >&2
+fi
+
+# Secondary signal: the original awk/grep heuristic over the literal
+# `[dependencies]` table. Kept as defence-in-depth (it also flags any crate dir
+# missing from the allowlist) and is the sole check when metadata is absent.
 for dir in crates/*/; do
     name=$(awk -F\" '/^name *=/{print $2; exit}' "$dir/Cargo.toml")
     if [ -z "${allowed[$name]+set}" ]; then
@@ -61,10 +99,7 @@ for dir in crates/*/; do
     deps=$(awk '/^\[dependencies\]/{s=1;next} /^\[/{s=0} s && /path *=/{print}' "$dir/Cargo.toml" \
         | grep -oE 'passman-[a-z]+' | sort -u || true)
     for d in $deps; do
-        case " ${allowed[$name]} " in
-        *" $d "*) : ;;
-        *) err "$name depends on $d, not allowed by §2.2 (allowed: '${allowed[$name]}')" ;;
-        esac
+        check_edge "$name" "$d"
     done
 done
 

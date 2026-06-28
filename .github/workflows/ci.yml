@@ -3,6 +3,10 @@ name: CI
 on:
   push:
   pull_request:
+  schedule:
+    # Nightly deep-fuzz lane (the `fuzz-extended` job below is gated to this and
+    # is non-blocking). 03:17 UTC — an off-peak, arbitrary minute.
+    - cron: "17 3 * * *"
 
 # Cancel superseded runs on the same ref.
 concurrency:
@@ -16,7 +20,7 @@ jobs:
   # The §2.4 / §9.5 merge gate: format, lints, architectural boundaries, tests,
   # and the supply-chain checks. The toolchain is pinned by rust-toolchain.toml.
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: System libraries (gtk4, TPM2, dbus)
@@ -34,39 +38,73 @@ jobs:
         run: ./scripts/check-boundaries.sh
       - name: Tests
         run: cargo test --workspace
+      # Supply-chain tooling installed as prebuilt binaries (no from-source
+      # `cargo install` every run). taiki-e/install-action fetches a release
+      # binary and falls back to cargo install only if a pinned version lacks one.
+      - name: Install cargo-audit + cargo-deny (prebuilt)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.22.2,cargo-deny@0.19.9
       - name: cargo-audit (RUSTSEC)
-        run: |
-          cargo install cargo-audit --version 0.22.2 --locked
-          cargo audit
+        run: cargo audit
       - name: cargo-deny (licenses / bans / sources / advisories)
-        run: |
-          cargo install cargo-deny --version 0.19.9 --locked
-          cargo deny check
+        run: cargo deny check
 
   # §10 / §9.5: parser fuzzing gates merges. A bounded smoke run per top-attack-
-  # surface parser; a crash writes an artifact and fails the job.
+  # surface parser, started from the committed seed corpus (fuzz/corpus/<target>);
+  # a crash writes an artifact and fails the job.
   fuzz:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: System libraries
         run: |
           sudo apt-get update
           sudo apt-get install -y libtss2-dev libdbus-1-dev
-      - name: Nightly + cargo-fuzz
-        run: |
-          rustup toolchain install nightly --profile minimal --component rust-src
-          cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Nightly toolchain
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+      - name: Install cargo-fuzz (prebuilt)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.2
       - uses: Swatinem/rust-cache@v2
-      - name: Fuzz the vault parser (smoke)
-        run: cd crates/passman-vault && cargo +nightly fuzz run vault_parse -- -max_total_time=60 -rss_limit_mb=2048 -timeout=10
-      - name: Fuzz the recovery parser (smoke)
-        run: cd crates/passman-recovery && cargo +nightly fuzz run recovery_import -- -max_total_time=60 -rss_limit_mb=2048 -timeout=10
+      - name: Fuzz the vault parser (smoke, seeded corpus)
+        run: cd crates/passman-vault && cargo +nightly fuzz run vault_parse fuzz/corpus/vault_parse -- -max_total_time=60 -rss_limit_mb=2048 -timeout=10
+      - name: Fuzz the recovery parser (smoke, seeded corpus)
+        run: cd crates/passman-recovery && cargo +nightly fuzz run recovery_import fuzz/corpus/recovery_import -- -max_total_time=60 -rss_limit_mb=2048 -timeout=10
+
+  # Medium/prod: a longer, NON-BLOCKING fuzz lane on the nightly schedule. The PR
+  # gate stays the fast 60s `fuzz` job above; this one explores deeper from the
+  # same committed seed corpus. `continue-on-error` keeps it advisory: a finding
+  # surfaces in the run log but never gates a merge.
+  fuzz-extended:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    continue-on-error: true # non-blocking: scheduled deep fuzz is advisory only
+    steps:
+      - uses: actions/checkout@v4
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libtss2-dev libdbus-1-dev
+      - name: Nightly toolchain
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+      - name: Install cargo-fuzz (prebuilt)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - uses: Swatinem/rust-cache@v2
+      - name: Fuzz the vault parser (extended)
+        run: cd crates/passman-vault && cargo +nightly fuzz run vault_parse fuzz/corpus/vault_parse -- -max_total_time=900 -rss_limit_mb=2048 -timeout=10
+      - name: Fuzz the recovery parser (extended)
+        run: cd crates/passman-recovery && cargo +nightly fuzz run recovery_import fuzz/corpus/recovery_import -- -max_total_time=900 -rss_limit_mb=2048 -timeout=10
 
   # End-to-end CLI smoke against a software TPM (the real TPM2 backend, isolated
-  # in a tempdir). Skips gracefully if swtpm is unavailable.
+  # in a tempdir). swtpm is a HARD requirement here: the job installs it and the
+  # smoke script FAILS (does not skip) if it is missing — only ad-hoc local runs
+  # may opt out via PASSMAN_ALLOW_SWTPM_SKIP=1 (see scripts/smoke-cli-swtpm.sh).
   swtpm-smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: System libraries (TPM2 + swtpm)
@@ -81,10 +119,126 @@ jobs:
       - name: Smoke test against swtpm
         run: ./scripts/smoke-cli-swtpm.sh ./target/release/passman
 
+  # B4: Android surface gate. Cross-compiles the FFI cdylib for the shipped ABIs,
+  # smoke-checks the UniFFI Kotlin bindgen, then builds + lints the Gradle app.
+  # The Rust cross-compile and assembleDebug are REQUIRED — a failure fails CI.
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Java 17 (matches the app's JavaVersion.VERSION_17)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: false
+      - name: Rust Android targets
+        run: |
+          rustup show
+          rustup target add aarch64-linux-android x86_64-linux-android
+      - name: Install cargo-ndk (prebuilt)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk@4.1.2
+      - uses: Swatinem/rust-cache@v2
+      # The FFI cdylib (android-keystore feature only — pure Rust, no libtss2/
+      # libdbus/gtk) is the one crate with target-specific output. `-o` drops the
+      # per-ABI libpassman_uniffi.so straight into the app's jniLibs.
+      - name: Cross-compile the FFI cdylib (arm64-v8a + x86_64) into jniLibs
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          cargo ndk -t arm64-v8a -t x86_64 -o android/app/src/main/jniLibs \
+            build -p passman-uniffi --release
+      # Smoke-check the bindgen entrypoint in isolation (temp dir): proves the
+      # uniffi-bindgen bin runs and emits Kotlin from the compiled library.
+      - name: UniFFI Kotlin bindgen smoke (temp dir)
+        run: |
+          cargo build -p passman-uniffi
+          cargo run -p passman-uniffi --features bindgen --bin uniffi-bindgen -- \
+            generate --library target/debug/libpassman_uniffi.so \
+            --language kotlin --out-dir "${RUNNER_TEMP}/uniffi-bindgen-smoke"
+      # Generate the bindings the hand-written Kotlin actually compiles against.
+      - name: Generate the Kotlin bindings for the app build
+        run: |
+          cargo run -p passman-uniffi --features bindgen --bin uniffi-bindgen -- \
+            generate --library target/debug/libpassman_uniffi.so \
+            --language kotlin --out-dir android/app/src/main/kotlin
+      - name: assembleDebug (required)
+        working-directory: android
+        run: ./gradlew --no-daemon :app:assembleDebug
+      - name: lintDebug
+        working-directory: android
+        run: ./gradlew --no-daemon :app:lintDebug
+
+  # B4 (best-effort): run the on-device instrumented test on an x86_64 emulator.
+  # This is the ONLY non-required Android job — emulator runs are heavy and
+  # occasionally flaky (KVM availability, boot timing), so it is marked
+  # `continue-on-error` and must NEVER block a merge. The required Android
+  # coverage is the `android` job above; this is extra signal only.
+  android-emulator:
+    runs-on: ubuntu-24.04
+    continue-on-error: true # non-blocking: emulator flakiness must not gate merges
+    steps:
+      - uses: actions/checkout@v4
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: false
+      - name: Rust Android target (x86_64 emulator)
+        run: |
+          rustup show
+          rustup target add x86_64-linux-android
+      - name: Install cargo-ndk (prebuilt)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk@4.1.2
+      - uses: Swatinem/rust-cache@v2
+      - name: Cross-compile the FFI cdylib (x86_64) into jniLibs
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          cargo ndk -t x86_64 -o android/app/src/main/jniLibs \
+            build -p passman-uniffi --release
+      - name: Generate the Kotlin bindings
+        run: |
+          cargo build -p passman-uniffi
+          cargo run -p passman-uniffi --features bindgen --bin uniffi-bindgen -- \
+            generate --library target/debug/libpassman_uniffi.so \
+            --language kotlin --out-dir android/app/src/main/kotlin
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Instrumented test (KeystoreBridgeInstrumentedTest) on API 30
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: google_apis
+          working-directory: android
+          script: ./gradlew --no-daemon :app:connectedDebugAndroidTest
+
   # S8 fix: the RELEASE.md claim that CI runs reproduce.sh twice and diffs the
   # hashes.  Two independent checkouts → two builds → SHA-256 comparison.
   build-twice:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -121,7 +275,7 @@ jobs:
 
   # Supply-chain fix: verify gradle-wrapper.jar against Gradle's known-good list.
   gradle-wrapper-validation:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: gradle/actions/wrapper-validation@v4

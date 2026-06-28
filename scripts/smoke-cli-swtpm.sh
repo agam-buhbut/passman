@@ -7,8 +7,20 @@ set -euo pipefail
 BIN="${1:?usage: smoke-cli-swtpm.sh <path-to-passman-binary>}"
 MASTER='Sm0ke-Test-Master-Passphrase!'
 
-command -v swtpm >/dev/null || { echo "SKIP: swtpm not installed"; exit 0; }
-command -v python3 >/dev/null || { echo "SKIP: python3 not installed"; exit 0; }
+# swtpm + python3 are HARD requirements: in CI a missing dependency must FAIL
+# the job, never silently pass. The only escape is for ad-hoc LOCAL runs without
+# a software TPM installed: set PASSMAN_ALLOW_SWTPM_SKIP=1 to downgrade a missing
+# dependency to a clean skip. CI never sets this, so CI fails hard.
+require() {
+  command -v "$1" >/dev/null && return 0
+  if [ "${PASSMAN_ALLOW_SWTPM_SKIP:-0}" = "1" ]; then
+    echo "SKIP: $1 not installed (PASSMAN_ALLOW_SWTPM_SKIP=1)"; exit 0
+  fi
+  echo "FAIL: $1 not installed (required; set PASSMAN_ALLOW_SWTPM_SKIP=1 for local runs)" >&2
+  exit 1
+}
+require swtpm
+require python3
 
 STATE_DIR="$(mktemp -d)"
 VAULT_DIR="$(mktemp -d)"
