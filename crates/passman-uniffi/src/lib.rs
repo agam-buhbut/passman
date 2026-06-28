@@ -783,7 +783,10 @@ mod tests {
         let strong = estimate_strength("xK7#mP2$qR9vL4nB8wZ!jH3tY6&".to_owned());
         assert!(weak <= 4 && strong <= 4, "scores must be within 0..=4");
         assert!(strong > weak, "a strong password must outscore a weak one");
-        assert!(strong >= 3, "a high-entropy password should reach Strong+ (>=3)");
+        assert!(
+            strong >= 3,
+            "a high-entropy password should reach Strong+ (>=3)"
+        );
     }
 
     #[test]
