@@ -1004,6 +1004,12 @@ fn handle_response(ui: &Rc<Ui>, response: Response) {
         Response::Error { message } => {
             ui.status.set_text(&message);
         }
+        // Android-only responses (recovery export / TOTP confirm, B7/B8). The
+        // desktop shell does not yet send those requests, so it cannot receive
+        // these; ignore them here. (GTK recovery-export wiring is a follow-up.)
+        Response::RecoveryExported { .. }
+        | Response::RecoveryExportFailed { .. }
+        | Response::TotpChecked { .. } => {}
     }
 }
 

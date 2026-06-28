@@ -27,6 +27,7 @@ use crate::{
 use passman_crypto::{KdfParams, SecretString};
 use passman_hsm::{BiometricPrompter, HardwareKeyStore};
 use passman_policy::{Charset, EntryPolicy, GenerationRequest, RequiredClasses};
+use passman_recovery::RecoveryPreset;
 use passman_totp::TotpConfig;
 use passman_vault::{EntryId, EntryRecord};
 
@@ -66,6 +67,23 @@ pub enum Request {
     },
     /// Remove an entry by id.
     Remove { id: EntryId },
+    /// Export a single-factor recovery backup (B7, `architecture.md` §7.5). Runs
+    /// fresh re-auth (HSM unwrap + TOTP + probe) and the aggressive recovery
+    /// Argon2id, then returns the encrypted backup bytes for the shell to write.
+    ExportRecovery {
+        /// Master password, re-entered for the §7.5 fresh re-auth.
+        master: SecretString,
+        /// A FRESH TOTP code for the re-auth (not the one used at unlock).
+        code: String,
+        /// Recovery Argon2id cost preset.
+        preset: RecoveryPreset,
+    },
+    /// Verify a TOTP code against the live session seed (B8 — confirm right after
+    /// vault creation that the authenticator was provisioned correctly).
+    VerifyTotp {
+        /// The candidate TOTP code.
+        code: String,
+    },
     /// Lock the session (drop the keys); the UI returns to the unlock screen.
     Lock,
     /// Stop the worker and exit the thread.
@@ -102,6 +120,19 @@ pub enum Response {
     Generated { password: SecretString },
     /// The session locked (timeout, explicit lock, or an op found it expired).
     Locked,
+    /// A recovery backup was exported; carries the encrypted file bytes (the
+    /// shell writes them to a user-chosen location).
+    RecoveryExported {
+        /// The encrypted recovery file bytes.
+        file: Vec<u8>,
+    },
+    /// A recovery export failed; carries a user-facing message (never a secret).
+    RecoveryExportFailed { message: String },
+    /// The result of a [`Request::VerifyTotp`] check.
+    TotpChecked {
+        /// Whether the supplied code is currently valid.
+        valid: bool,
+    },
     /// A non-fatal operation error to surface to the user.
     Error { message: String },
 }
@@ -211,6 +242,7 @@ fn run_worker<H, C>(
                             &mut unlocked,
                             clipboard.as_ref(),
                             fact_overwrite,
+                            prompter.as_ref(),
                             requests,
                             responses,
                         ) {
@@ -240,6 +272,7 @@ fn run_worker<H, C>(
                             &mut unlocked,
                             clipboard.as_ref(),
                             fact_overwrite,
+                            prompter.as_ref(),
                             requests,
                             responses,
                         ) {
@@ -282,6 +315,7 @@ fn drive_unlocked<H, C>(
     unlocked: &mut UnlockedApp<H>,
     clipboard: Option<&C>,
     fact_overwrite: bool,
+    prompter: &dyn BiometricPrompter,
     requests: &Receiver<Request>,
     responses: &Sender<Response>,
 ) -> bool
@@ -289,7 +323,14 @@ where
     H: HardwareKeyStore<PlatformCtx = ()>,
     C: Clipboard,
 {
-    match unlocked_loop(unlocked, clipboard, fact_overwrite, requests, responses) {
+    match unlocked_loop(
+        unlocked,
+        clipboard,
+        fact_overwrite,
+        prompter,
+        requests,
+        responses,
+    ) {
         Flow::Quit => true,
         // Lock / Continue return to the locked loop; `unlocked` drops at the call
         // site, zeroizing K_master.
@@ -316,6 +357,7 @@ fn unlocked_loop<H, C>(
     unlocked: &mut UnlockedApp<H>,
     clipboard: Option<&C>,
     fact_overwrite: bool,
+    prompter: &dyn BiometricPrompter,
     requests: &Receiver<Request>,
     responses: &Sender<Response>,
 ) -> Flow
@@ -338,6 +380,7 @@ where
                     unlocked,
                     clipboard,
                     fact_overwrite,
+                    prompter,
                     request,
                     responses,
                     &mut live_cookie,
@@ -421,6 +464,7 @@ fn handle_unlocked<H, C>(
     unlocked: &mut UnlockedApp<H>,
     clipboard: Option<&C>,
     fact_overwrite: bool,
+    prompter: &dyn BiometricPrompter,
     request: Request,
     responses: &Sender<Response>,
     live_cookie: &mut Option<ClipboardCookie>,
@@ -506,6 +550,27 @@ where
             },
             Err(e) => return on_op_error(&e, responses),
         },
+        Request::ExportRecovery {
+            master,
+            code,
+            preset,
+        } => match unlocked.export_recovery(&master, code.trim(), preset, &(), prompter) {
+            Ok(file) => send_or_lock(responses, Response::RecoveryExported { file }),
+            // A locked session locks the worker, exactly like every other op
+            // (see `on_op_error`); any other failure surfaces as an
+            // export-specific message via the same no-secret mapping.
+            Err(CoreError::Locked) => return Flow::Lock,
+            Err(e) => send_or_lock(
+                responses,
+                Response::RecoveryExportFailed {
+                    message: operation_message(&e),
+                },
+            ),
+        },
+        Request::VerifyTotp { code } => {
+            let valid = unlocked.verify_totp_code(code.trim());
+            send_or_lock(responses, Response::TotpChecked { valid });
+        }
     }
     Flow::Continue
 }

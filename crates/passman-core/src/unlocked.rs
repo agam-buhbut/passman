@@ -10,10 +10,11 @@
 //! Passwords are decrypted **on demand** (reveal / copy / export), never in
 //! bulk; only labels live in memory while unlocked (§4.4).
 
-use passman_crypto::{ct_eq, MasterKey, SecretString};
+use passman_crypto::{ct_eq, KdfParams, MasterKey, SecretBytes, SecretString};
 use passman_hsm::{BiometricPrompter, HsmSlot};
 use passman_policy::{
     classify, estimate_master, generate, EntryPolicy, GenerationRequest, MasterEntropy,
+    StrengthTier,
 };
 use passman_recovery::{export, ExportPayload, RecoveryEntry, RecoveryPreset};
 use passman_vault::{EntryId, EntryRecord, Index, IndexEntry, Vault};
@@ -68,6 +69,13 @@ pub struct UnlockedApp<'a, H: passman_hsm::HardwareKeyStore> {
     app: &'a App<H>,
     /// The root vault key. Zeroizing; scrubbed on drop.
     k_master: MasterKey,
+    /// The vault's TOTP seed `S`, unwrapped at unlock/create and retained for the
+    /// session so the shell can confirm a code without an HSM round-trip (B8).
+    /// Zeroizing; scrubbed on drop. Held alongside `k_master`, which already
+    /// grants full vault access, so keeping the seed resident adds no new unlock
+    /// capability to a memory-scraping attacker (a fresh unlock still needs the
+    /// master password and `K_hsm` from the HSM, neither of which is retained).
+    totp_seed: SecretBytes,
     /// The decrypted index (labels + policies only).
     index: Index,
     /// Session expiry as Unix seconds (no sliding — `architecture.md` §5.2).
@@ -91,6 +99,7 @@ impl<'a, H: passman_hsm::HardwareKeyStore> UnlockedApp<'a, H> {
     pub(crate) fn new(
         app: &'a App<H>,
         k_master: MasterKey,
+        totp_seed: SecretBytes,
         index: Index,
         session_expiry: u64,
         session_token: SessionToken,
@@ -98,6 +107,7 @@ impl<'a, H: passman_hsm::HardwareKeyStore> UnlockedApp<'a, H> {
         Self {
             app,
             k_master,
+            totp_seed,
             index,
             session_expiry,
             session_token,
@@ -311,6 +321,25 @@ impl<'a, H: passman_hsm::HardwareKeyStore> UnlockedApp<'a, H> {
         self.ensure_unlocked()?;
         let vault = self.load_vault()?;
         Ok(estimate_master(password, user_inputs, &vault.kdf_params()))
+    }
+
+    /// Verify a TOTP `code` against this session's seed (B8 — confirm right after
+    /// vault creation that the authenticator was provisioned correctly).
+    ///
+    /// Reuses the parent [`App`]'s long-lived verifier (and its replay cache),
+    /// exactly like [`App::unlock`] and the export re-auth, so a code consumed
+    /// here cannot subsequently be replayed for a real unlock — the accepted
+    /// existing semantics. A one-off confirm right after create is the intended
+    /// use and does not interfere with the just-created session.
+    ///
+    /// Takes no `ctx`/prompter: the seed is already held in the live session, so
+    /// no HSM unwrap (and thus no biometric prompt) is required. Returns whether
+    /// the code is currently valid.
+    #[must_use]
+    pub fn verify_totp_code(&self, code: &str) -> bool {
+        self.app
+            .reverify_totp(self.totp_seed.expose(), code)
+            .is_ok()
     }
 
     /// Change the master password, re-deriving `K_master` over the **same**
@@ -564,6 +593,27 @@ impl<'a, H: passman_hsm::HardwareKeyStore> UnlockedApp<'a, H> {
     /// Current time as Unix seconds (`i64`, for metadata).
     fn now_i64(&self) -> i64 {
         i64::try_from(self.now()).unwrap_or(i64::MAX)
+    }
+}
+
+/// Estimate a candidate password's strength as a coarse score in `0..=4`, for a
+/// create-screen meter: Dangerous = 0, Weak = 1, Acceptable = 2, Strong = 3,
+/// Excellent = 4 (the `architecture.md` §8.4 tiers).
+///
+/// Standalone: needs no unlocked session (and no vault), so a shell can score a
+/// master password on the create screen before any vault exists. Delegates to
+/// the same zxcvbn-backed [`estimate_master`] used by
+/// [`UnlockedApp::estimate_master_strength`]; only the [`StrengthTier`] is read,
+/// which depends solely on the password (not the KDF), so a fixed reference
+/// [`KdfParams`] is passed and does not affect the score.
+#[must_use]
+pub fn estimate_password_strength(password: &SecretString) -> u8 {
+    match estimate_master(password.expose(), &[], &KdfParams::MEDIUM).tier {
+        StrengthTier::Dangerous => 0,
+        StrengthTier::Weak => 1,
+        StrengthTier::Acceptable => 2,
+        StrengthTier::Strong => 3,
+        StrengthTier::Excellent => 4,
     }
 }
 

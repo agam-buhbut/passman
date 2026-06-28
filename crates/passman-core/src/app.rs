@@ -227,9 +227,11 @@ impl<H: HardwareKeyStore> App<H> {
 
         let uri = build_provisioning_uri(&seed, totp_cfg);
 
-        // The freshly-created vault has an empty index.
+        // The freshly-created vault has an empty index. Retain the seed in the
+        // session so the shell can confirm a TOTP code (B8) without re-unwrapping.
         let index = vault.open_index(&k_master)?;
-        let unlocked = self.build_unlocked(k_master, index);
+        let totp_seed = SecretBytes::new(seed.expose().to_vec());
+        let unlocked = self.build_unlocked(k_master, totp_seed, index);
         Ok((unlocked, uri))
     }
 
@@ -356,6 +358,10 @@ impl<H: HardwareKeyStore> App<H> {
             .open_index(&k_master)
             .map_err(|e| UnlockError::MalformedVault(e.into()))?;
 
+        // Retain the unwrapped seed in the session for in-session TOTP
+        // confirmation (B8); `seed` is the bytes unwrapped from the TotpSeed slot.
+        let totp_seed = seed;
+
         // Step 8: success — reset the advisory counter (persist) and build the
         // session. Always clear the in-process coalesced state, even when the
         // on-disk header is already clean (sub-threshold failures may have been
@@ -376,7 +382,7 @@ impl<H: HardwareKeyStore> App<H> {
             let _ = crate::storage::atomic_write(&self.vault_path, &vault.to_bytes());
         }
 
-        Ok(self.build_unlocked(k_master, index))
+        Ok(self.build_unlocked(k_master, totp_seed, index))
     }
 
     /// Import a recovery file and provision a fresh vault at this app's path
@@ -452,7 +458,9 @@ impl<H: HardwareKeyStore> App<H> {
         self.set_totp_config(totp_cfg);
         let uri = build_provisioning_uri(&seed, totp_cfg);
         let index = vault.open_index(&k_master)?;
-        let unlocked = self.build_unlocked(k_master, index);
+        // Retain the seed in the session for in-session TOTP confirmation (B8);
+        // `seed_material` is the same seed `S` already enrolled into the slot.
+        let unlocked = self.build_unlocked(k_master, seed_material, index);
         Ok((unlocked, uri))
     }
 
@@ -573,15 +581,19 @@ impl<H: HardwareKeyStore> App<H> {
     }
 
     /// Build an [`UnlockedApp`] with a fresh session token and a 120 s expiry.
+    /// `totp_seed` is the vault's seed `S`, retained in the session for in-session
+    /// TOTP confirmation (B8).
     fn build_unlocked(
         &self,
         k_master: MasterKey,
+        totp_seed: SecretBytes,
         index: passman_vault::Index,
     ) -> UnlockedApp<'_, H> {
         let now = self.now_unix_secs_u64();
         UnlockedApp::new(
             self,
             k_master,
+            totp_seed,
             index,
             now.saturating_add(SESSION_SECS),
             SessionToken::generate(),

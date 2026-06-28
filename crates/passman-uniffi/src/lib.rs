@@ -23,7 +23,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use passman_core::worker::{Request, Response};
-use passman_core::{App, ClipboardCookie, EntryHandle, RevealField, Session};
+use passman_core::{App, ClipboardCookie, EntryHandle, RecoveryPreset, RevealField, Session};
 use passman_crypto::{KdfParams, SecretString};
 use passman_hsm::{
     AndroidKeyStore, BiometricPrompter, HsmError, KeystoreError, KeystoreSecurityLevel,
@@ -333,6 +333,28 @@ impl KdfChoice {
     }
 }
 
+/// Recovery-export Argon2id cost preset (§7.4), mirrored for Kotlin. Maps to the
+/// core/recovery [`RecoveryPreset`] (mirrors the [`KdfChoice`] pattern).
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum RecoveryChoice {
+    /// 1 GiB / t=4 — the minimum the recovery format permits.
+    Floor,
+    /// 4 GiB / t=8 — the default.
+    Default,
+    /// 8 GiB / t=12.
+    Paranoid,
+}
+
+impl RecoveryChoice {
+    fn preset(self) -> RecoveryPreset {
+        match self {
+            RecoveryChoice::Floor => RecoveryPreset::Floor,
+            RecoveryChoice::Default => RecoveryPreset::Default,
+            RecoveryChoice::Paranoid => RecoveryPreset::Paranoid,
+        }
+    }
+}
+
 /// A non-secret entry handle (id + label).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct EntryItem {
@@ -560,6 +582,46 @@ impl PassmanApp {
         }
     }
 
+    /// Export a single-factor recovery backup (B7, §7.5): re-enter the master
+    /// password and a FRESH TOTP code (not the unlock code), run the aggressive
+    /// recovery Argon2id, and return the encrypted backup bytes for the Kotlin
+    /// side to write to a user-chosen location.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::Failed`] on a weak master, failed re-auth, or export error;
+    /// [`AppError::SessionLocked`] if the session expired.
+    pub fn export_recovery(
+        &self,
+        master: String,
+        code: String,
+        preset: RecoveryChoice,
+    ) -> Result<Vec<u8>, AppError> {
+        match self.call(Request::ExportRecovery {
+            master: SecretString::new(master),
+            code,
+            preset: preset.preset(),
+        }) {
+            Response::RecoveryExported { file } => Ok(file),
+            Response::RecoveryExportFailed { message } => Err(AppError::Failed { detail: message }),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Confirm a TOTP `code` against the live session seed (B8 — verify right
+    /// after [`PassmanApp::create_vault`] that the authenticator was provisioned
+    /// correctly). Returns whether the code is currently valid.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::SessionLocked`] if the session expired.
+    pub fn verify_totp(&self, code: String) -> Result<bool, AppError> {
+        match self.call(Request::VerifyTotp { code }) {
+            Response::TotpChecked { valid } => Ok(valid),
+            other => Err(unexpected(&other)),
+        }
+    }
+
     /// Lock the session (drop the keys). **Fire-and-forget**, exactly like
     /// [`PassmanApp::clear_clipboard`]: it takes the lock only to `send`, then
     /// returns without awaiting the worker's reply.
@@ -651,14 +713,24 @@ fn unexpected(response: &Response) -> AppError {
 #[uniffi::export]
 pub fn android_init() {}
 
+/// Estimate a candidate password's strength as a coarse `0..=4` score for the
+/// create screen (0 = Dangerous … 4 = Excellent). Standalone: needs no session,
+/// so the Kotlin create screen can score the master password before any vault
+/// exists. Routes through `passman-core` (no direct policy dependency here).
+#[uniffi::export]
+#[must_use]
+pub fn estimate_strength(password: String) -> u8 {
+    passman_core::estimate_password_strength(&SecretString::new(password))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        entry_id, fixed_digest, unexpected, AppError, EntryItem, FieldKind, KdfChoice,
-        KeystoreFailure, SecurityLevel,
+        entry_id, estimate_strength, fixed_digest, unexpected, AppError, EntryItem, FieldKind,
+        KdfChoice, KeystoreFailure, RecoveryChoice, SecurityLevel,
     };
     use passman_core::worker::Response;
-    use passman_core::{EntryHandle, RevealField};
+    use passman_core::{EntryHandle, RecoveryPreset, RevealField};
     use passman_crypto::KdfParams;
     use passman_hsm::{KeystoreError, KeystoreSecurityLevel};
     use passman_vault::EntryId;
@@ -692,6 +764,26 @@ mod tests {
             let p = choice.params();
             assert_eq!((p.m_kib, p.t, p.p), (preset.m_kib, preset.t, preset.p));
         }
+    }
+
+    #[test]
+    fn recovery_choice_maps_to_the_preset() {
+        for (choice, preset) in [
+            (RecoveryChoice::Floor, RecoveryPreset::Floor),
+            (RecoveryChoice::Default, RecoveryPreset::Default),
+            (RecoveryChoice::Paranoid, RecoveryPreset::Paranoid),
+        ] {
+            assert_eq!(choice.preset(), preset);
+        }
+    }
+
+    #[test]
+    fn estimate_strength_returns_a_sane_score() {
+        let weak = estimate_strength("password".to_owned());
+        let strong = estimate_strength("xK7#mP2$qR9vL4nB8wZ!jH3tY6&".to_owned());
+        assert!(weak <= 4 && strong <= 4, "scores must be within 0..=4");
+        assert!(strong > weak, "a strong password must outscore a weak one");
+        assert!(strong >= 3, "a high-entropy password should reach Strong+ (>=3)");
     }
 
     #[test]

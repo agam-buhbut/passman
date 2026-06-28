@@ -47,5 +47,11 @@ pub use lockout::{lockout_minutes, LockoutState};
 pub use progress::{NoProgress, Progress, ProgressError};
 pub use session::SessionToken;
 pub use storage::{atomic_write, read, InstanceLock};
-pub use unlocked::{EntryHandle, PasswordChangeOutcome, RevealField, UnlockedApp};
+pub use unlocked::{
+    estimate_password_strength, EntryHandle, PasswordChangeOutcome, RevealField, UnlockedApp,
+};
 pub use worker::{Request, Response, Session};
+
+// Re-exported so shells/bindings can name the recovery cost preset (carried by
+// `Request::ExportRecovery`) without depending on `passman-recovery` directly.
+pub use passman_recovery::RecoveryPreset;

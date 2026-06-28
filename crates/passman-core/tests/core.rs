@@ -1198,6 +1198,109 @@ fn import_recovery_round_trips_via_cheap_file() {
 }
 
 #[test]
+fn estimate_password_strength_scores_weak_below_strong() {
+    // Standalone (no session/vault): the create screen can score a candidate
+    // master password. zxcvbn-backed tiers map to 0..=4 (Dangerous..Excellent).
+    use passman_core::estimate_password_strength;
+
+    let weak = estimate_password_strength(&pw("password"));
+    let strong = estimate_password_strength(&pw("xK7#mP2$qR9vL4nB8wZ!jH3tY6&"));
+    assert!(weak <= 1, "a common password must score low (got {weak})");
+    assert!(
+        strong >= 3,
+        "a high-entropy password must score Strong+ (got {strong})"
+    );
+    assert!(strong > weak);
+    // The empty password is the worst case.
+    assert_eq!(estimate_password_strength(&pw("")), 0);
+}
+
+#[test]
+fn verify_totp_code_accepts_valid_and_rejects_wrong() {
+    // B8: confirm a TOTP code against the live session seed right after create.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clock = TestClock::at(22_000_000);
+    let app = open_app(dir.path(), clock.clone());
+    let prompter = MockPrompter::authenticating();
+    let (unlocked, uri) = app
+        .create_vault(
+            &pw("Str0ng-Master-P@ssphrase!"),
+            FAST_KDF,
+            TotpConfig::default(),
+            &(),
+            &prompter,
+        )
+        .expect("create");
+    let seed = seed_from_uri(uri.expose());
+
+    // A currently-valid code verifies against the retained session seed.
+    let code = valid_code(&seed, clock.now_secs());
+    assert!(unlocked.verify_totp_code(&code), "valid code must verify");
+
+    // A clearly-wrong code is rejected (and the valid one above was consumed by
+    // the shared verifier's replay cache — the accepted existing semantics).
+    assert!(
+        !unlocked.verify_totp_code("000000"),
+        "a wrong code must be rejected"
+    );
+    unlocked.lock();
+}
+
+/// `Request::ExportRecovery` routes through the session worker and returns the
+/// encrypted backup bytes (B7).
+///
+/// Ignored by default: `export_recovery` runs the real recovery Floor (1 GiB /
+/// t=4 Argon2id, `architecture.md` §7.4) — there is no cheap-params seam on the
+/// export path — plus the vault's own create derivation. Run explicitly on a
+/// machine with >=1 GiB free:
+/// `cargo test -p passman-core -- --ignored export_recovery_routes_through_worker`.
+#[test]
+#[ignore = "ExportRecovery runs the real 1 GiB recovery Argon2 floor — too slow/heavy for the default run"]
+fn export_recovery_routes_through_worker() {
+    use passman_core::worker::{Request, Response};
+    use passman_core::Session;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clock = TestClock::at(21_000_000);
+    let master = "xK7#mP2$qR9vL4nB8wZ!jH3tY6&";
+    let app = open_app(dir.path(), clock.clone());
+
+    let (session, responses) = Session::spawn(
+        app,
+        || Ok(MockClipboard::default()),
+        Box::new(MockPrompter::authenticating()),
+        true,
+    );
+
+    // Create the vault; capture the provisioning URI to derive a valid code.
+    session.send(Request::Create {
+        master: pw(master),
+        kdf: RecoveryPreset::Floor.params(),
+    });
+    let uri = match responses.recv().expect("created resp") {
+        Response::Created {
+            provisioning_uri, ..
+        } => provisioning_uri.expose().to_owned(),
+        other => panic!("expected Created, got {other:?}"),
+    };
+    let seed = seed_from_uri(&uri);
+
+    // Export a recovery backup with a FRESH TOTP code.
+    let code = valid_code(&seed, clock.now_secs());
+    session.send(Request::ExportRecovery {
+        master: pw(master),
+        code,
+        preset: RecoveryPreset::Floor,
+    });
+    match responses.recv().expect("export resp") {
+        Response::RecoveryExported { file } => {
+            assert!(!file.is_empty(), "the backup must carry bytes");
+        }
+        other => panic!("expected RecoveryExported, got {other:?}"),
+    }
+}
+
+#[test]
 fn unlock_rejects_out_of_range_kdf_params_cleanly() {
     // B1: a hostile/corrupt header carrying an absurd Argon2id memory cost must
     // fail unlock with a clean error BEFORE any derivation — never a panic and
