@@ -84,6 +84,23 @@ pub enum RecoveryError {
         floor_p: u8,
     },
 
+    /// `import` was handed Argon2 parameters outside the universal safety
+    /// limits ([`passman_crypto::KdfParams::within_limits`]).
+    ///
+    /// The header KDF cost is attacker-controlled and feeds Argon2id *before*
+    /// any authentication, so an out-of-range memory/time cost is rejected up
+    /// front to deny a pre-auth resource-exhaustion `DoS` (OOM/hang, fatal on
+    /// mobile). The message names the offending costs but never the password.
+    #[error("recovery Argon2 parameters are out of range: m={m_kib} KiB/t={t}/p={p}")]
+    KdfParamsOutOfRange {
+        /// Supplied memory cost (KiB).
+        m_kib: u32,
+        /// Supplied time cost.
+        t: u32,
+        /// Supplied parallelism.
+        p: u8,
+    },
+
     /// AEAD decryption of the payload failed authentication.
     ///
     /// Returned for a wrong password, a tampered ciphertext/tag, a tampered

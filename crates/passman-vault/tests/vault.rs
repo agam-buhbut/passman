@@ -544,6 +544,48 @@ fn old_unpadded_index_still_loads() {
 }
 
 #[test]
+fn mutating_a_v1_vault_does_not_corrupt_its_index() {
+    // Regression (B2): a loaded legacy v1 vault must survive mutation. Before the
+    // version-aware seal fix, add/remove re-sealed the index under v2 rules
+    // (padded plaintext + ad=[0x02]) while the on-disk header stayed v1, so the
+    // NEXT open failed the index AEAD — permanent, silent data loss. Here we load
+    // a genuine v1 vault, remove one entry and add another, reload, and assert
+    // the index and every surviving entry still decrypt.
+    let km = k_master();
+    let (v, ids) = vault_with_entries(2);
+    let mut parsed = Vault::from_bytes(&downgrade_to_v1(&v)).expect("v1 parses");
+    assert_eq!(parsed.format_version(), 0x01);
+
+    parsed.remove_entry(&km, &ids[0]).expect("remove v1 entry");
+    let new_id = EntryId::generate();
+    parsed
+        .add_or_update_entry(
+            &km,
+            new_id,
+            "added to v1".to_owned(),
+            EntryPolicy::default(),
+            &record("newuser", "newpass!", "https://new.example", "n"),
+        )
+        .expect("add v1 entry");
+
+    let reloaded = Vault::from_bytes(&parsed.to_bytes()).expect("mutated v1 parses");
+    assert_eq!(reloaded.format_version(), 0x01, "stays v1 on disk");
+    reloaded.verify_probe(&km).expect("probe still verifies");
+    let idx = reloaded.open_index(&km).expect("index opens after v1 mutation");
+    assert_eq!(idx.len(), 2, "one removed, one added");
+    assert!(idx.get(&ids[0]).is_none(), "removed entry is gone");
+    assert!(idx.get(&new_id).is_some(), "added entry present");
+    let surv = reloaded
+        .decrypt_entry(&km, &ids[1])
+        .expect("surviving entry decrypts");
+    assert_eq!(surv.username.expose(), "user1");
+    let added = reloaded
+        .decrypt_entry(&km, &new_id)
+        .expect("added entry decrypts");
+    assert_eq!(added.username.expose(), "newuser");
+}
+
+#[test]
 fn padded_index_with_oversized_true_len_is_rejected() {
     // A v2 padded index whose true_len prefix claims more bytes than the
     // (de-padded) plaintext holds must be rejected (no panic, Err). The padded

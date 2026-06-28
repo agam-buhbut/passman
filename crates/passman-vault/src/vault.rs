@@ -241,7 +241,8 @@ impl Vault {
                 reason: "probe ciphertext was not 32 bytes",
             })?;
 
-        let (sealed_index_nonce, sealed_index_ct) = seal_index(&Index::new(), k_master)?;
+        let (sealed_index_nonce, sealed_index_ct) =
+            seal_index(&Index::new(), FORMAT_VERSION, k_master)?;
 
         Ok(Self {
             format_version: FORMAT_VERSION,
@@ -459,9 +460,12 @@ impl Vault {
         Ok(Index::from_vec(rows))
     }
 
-    /// Re-encrypt `index` under a fresh nonce and store it.
+    /// Re-encrypt `index` under a fresh nonce and store it, using this vault's
+    /// own stored `format_version` so a loaded legacy v1 vault is re-sealed under
+    /// v1 rules (raw postcard, `ad=[0x01]`) rather than v2 — which would corrupt
+    /// its index on the next open (`architecture.md` §4.10).
     fn reseal_index(&mut self, index: &Index, k_master: &MasterKey) -> Result<(), VaultError> {
-        let (nonce, ct) = seal_index(index, k_master)?;
+        let (nonce, ct) = seal_index(index, self.format_version, k_master)?;
         self.sealed_index_nonce = nonce;
         self.sealed_index_ct = ct;
         Ok(())
@@ -700,17 +704,26 @@ fn entry_associated_data(format_version: u8, id: &EntryId) -> [u8; 1 + ENTRY_ID_
 /// label/policy byte lengths (threat #18 / §4.5).
 const INDEX_BUCKET: usize = crate::record::BUCKET;
 
-/// Seal an index (`FORMAT_VERSION` = `0x02`): postcard-serialize the rows, wrap
-/// them in the padded authenticated-plaintext encoding, then AEAD-encrypt under
-/// `K_index` with `ad = [FORMAT_VERSION]` and a fresh nonce. Returns
+/// Seal an index under `format_version`: postcard-serialize the rows, wrap them
+/// in the version-appropriate authenticated-plaintext encoding, then AEAD-encrypt
+/// under `K_index` with `ad = [format_version]` and a fresh nonce. Returns
 /// `(nonce, ct)`.
 ///
-/// The padded plaintext is `true_len(u32-LE) ‖ postcard ‖ zero-pad` to an
-/// [`INDEX_BUCKET`] multiple. `true_len` lives inside the AEAD, so the tag
-/// covers it and the padding is authenticated; the on-disk
-/// `sealed_index_ct_len` is therefore a bucket-quantized size class.
+/// The plaintext encoding is version-specific and MUST match the vault's own
+/// stored `format_version`:
+/// - v2 (`FORMAT_VERSION`): bucket-padded `true_len(u32-LE) ‖ postcard ‖
+///   zero-pad` to an [`INDEX_BUCKET`] multiple. `true_len` lives inside the AEAD,
+///   so the tag covers it and the padding is authenticated; the on-disk
+///   `sealed_index_ct_len` is therefore a bucket-quantized size class.
+/// - v1 (`FORMAT_VERSION_LEGACY_V1`): raw, unpadded postcard.
+///
+/// Sealing a loaded v1 vault under the v2 rules (or vice versa) would make
+/// [`Vault::decrypt_index`] fail on the next open — the AD-bound version and the
+/// padding rule must agree — so callers pass the vault's stored version, not the
+/// build's `FORMAT_VERSION`.
 fn seal_index(
     index: &Index,
+    format_version: u8,
     k_master: &MasterKey,
 ) -> Result<([u8; NONCE_LEN], Vec<u8>), VaultError> {
     let key = hkdf_expand(k_master, INDEX_INFO);
@@ -718,9 +731,13 @@ fn seal_index(
         postcard::to_stdvec(index.as_rows()).map_err(|_| VaultError::MalformedRecord {
             reason: "failed to serialize sealed index",
         })?;
-    let plaintext = pad_index_plaintext(&postcard_bytes);
+    let plaintext = if format_version == FORMAT_VERSION_LEGACY_V1 {
+        postcard_bytes
+    } else {
+        pad_index_plaintext(&postcard_bytes)
+    };
     let nonce = random_nonce();
-    let ad = [FORMAT_VERSION];
+    let ad = [format_version];
     let ct = aead::encrypt(&key, &nonce, &ad, &plaintext)?;
     Ok((nonce, ct))
 }

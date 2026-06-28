@@ -205,6 +205,15 @@ pub fn import(file_bytes: &[u8], password: &SecretString) -> Result<ExportPayloa
     let p = r.read_u8("argon2.p")?;
     let recovery_params = KdfParams { m_kib, t, p };
 
+    // Reject an out-of-range header KDF cost BEFORE deriving: these params are
+    // attacker-controlled and feed Argon2id before any authentication can fail,
+    // so an absurd memory/time cost would be a pre-auth resource-exhaustion DoS
+    // (OOM/hang, fatal on mobile). The strength *floor* is enforced only on the
+    // export side; this is the universal anti-DoS *ceiling* on the import side.
+    if !recovery_params.within_limits() {
+        return Err(RecoveryError::KdfParamsOutOfRange { m_kib, t, p });
+    }
+
     let recovery_salt = r.take_array::<SALT_LEN>("recovery_salt")?;
     let nonce = r.take_array::<{ aead::NONCE_LEN }>("nonce")?;
 
@@ -213,6 +222,14 @@ pub fn import(file_bytes: &[u8], password: &SecretString) -> Result<ExportPayloa
     // present, then require the file to end exactly there (no trailing bytes).
     let ciphertext = r.take(payload_ct_len, "payload_ct")?;
     r.expect_eof()?;
+
+    // A ciphertext shorter than the AEAD tag cannot authenticate; fail fast
+    // (detail-free, no oracle — folded into Decrypt) BEFORE the expensive
+    // Argon2id derivation runs, rather than spending it to reach a guaranteed
+    // InvalidLength inside aead::decrypt.
+    if ciphertext.len() < aead::TAG_LEN {
+        return Err(RecoveryError::Decrypt);
+    }
 
     let k_recovery = derive_recovery_key(password, &recovery_salt, &recovery_params)?;
 
@@ -304,6 +321,18 @@ mod tests {
         let wrong = SecretString::new("wrong password entirely".to_owned());
         let err = import(&file, &wrong).expect_err("wrong pw");
         assert!(matches!(err, RecoveryError::Decrypt));
+    }
+
+    #[test]
+    fn import_rejects_out_of_range_kdf_params() {
+        // Forge a header with an absurd Argon2 memory cost (u32::MAX ~ 4 TiB).
+        // import() must reject it up front — before any derivation — with the
+        // typed KdfParamsOutOfRange, denying the pre-auth resource-exhaustion DoS.
+        let mut file = export_with(&payload(1), &pw(), &TEST_PARAMS).expect("export");
+        // argon2.m occupies bytes [8..12]: magic(6) + version(1) + kdf_id(1).
+        file[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = import(&file, &pw()).expect_err("must reject out-of-range cost");
+        assert!(matches!(err, RecoveryError::KdfParamsOutOfRange { .. }));
     }
 
     #[test]
