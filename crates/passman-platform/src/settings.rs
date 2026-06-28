@@ -135,7 +135,10 @@ mod tests {
 
     #[test]
     fn empty_input_is_all_defaults() {
-        assert_eq!(Settings::from_toml("").expect("parse empty"), Settings::default());
+        assert_eq!(
+            Settings::from_toml("").expect("parse empty"),
+            Settings::default()
+        );
     }
 
     #[test]
@@ -155,7 +158,10 @@ mod tests {
     fn load_missing_file_yields_defaults() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("settings.toml");
-        assert_eq!(Settings::load(&path).expect("load missing"), Settings::default());
+        assert_eq!(
+            Settings::load(&path).expect("load missing"),
+            Settings::default()
+        );
     }
 
     #[test]

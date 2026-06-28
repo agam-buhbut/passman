@@ -55,10 +55,7 @@ pub trait HardwareKeyStore: Send + Sync {
     /// [`HsmError::HardwareAbsent`]); a successful query of a locked device
     /// returns `Ok(LockedOut { .. })`. `passman-core` treats a query *error* as
     /// non-fatal (the unwrap path still fails closed on a real lockout).
-    fn lockout_status(
-        &self,
-        ctx: &Self::PlatformCtx,
-    ) -> Result<HsmLockoutStatus, HsmError> {
+    fn lockout_status(&self, ctx: &Self::PlatformCtx) -> Result<HsmLockoutStatus, HsmError> {
         let _ = ctx;
         Ok(HsmLockoutStatus::Available)
     }

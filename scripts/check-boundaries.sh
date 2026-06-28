@@ -96,6 +96,22 @@ for c in $needs_forbid; do
     fi
 done
 
+# --- 4. cfg(target_*) confined to the HSM backend + binary shells ------------
+#
+# §2.4: platform-conditional code (cfg(target_os/arch/family/env/vendor/...))
+# belongs only in passman-hsm (per-platform FFI backends) and the binary shells
+# (cli/gtk/uniffi, which select platform-specific paths/behaviour). A pure
+# library crate or the core must stay platform-agnostic. `cfg(unix)` etc. are not
+# matched — only the `target_*` predicates that fork on a specific platform.
+
+platform_agnostic="passman-crypto passman-totp passman-policy passman-vault passman-recovery passman-core passman-platform"
+for c in $platform_agnostic; do
+    if hits=$(grep -rnE 'cfg!?\([^)]*target_(os|arch|family|env|vendor|pointer_width)' "crates/$c/src/"); then
+        err "$c must stay platform-agnostic but uses cfg(target_*) (§2.4 — only hsm + binary shells may):"
+        echo "$hits" >&2
+    fi
+done
+
 if [ "$fail" -ne 0 ]; then
     echo "Boundary checks FAILED." >&2
     exit 1

@@ -269,7 +269,13 @@ impl Fixture {
 
     /// Create the vault and return the TOTP seed decoded from the printed URI.
     fn init(&self) -> Vec<u8> {
-        let (r, io) = self.run(Command::Init { preset: Preset::Low }, &[MASTER, MASTER], &[]);
+        let (r, io) = self.run(
+            Command::Init {
+                preset: Preset::Low,
+            },
+            &[MASTER, MASTER],
+            &[],
+        );
         r.expect("init");
         let uri = io.out_starting("otpauth://").expect("provisioning URI");
         seed_from_uri(uri)
@@ -299,7 +305,13 @@ fn init_creates_vault_and_lists_empty() {
 fn init_refuses_to_overwrite_existing_vault() {
     let fx = Fixture::new();
     fx.init();
-    let (r, _io) = fx.run(Command::Init { preset: Preset::Low }, &[MASTER, MASTER], &[]);
+    let (r, _io) = fx.run(
+        Command::Init {
+            preset: Preset::Low,
+        },
+        &[MASTER, MASTER],
+        &[],
+    );
     assert!(r.is_err(), "second init must refuse");
     assert!(format!("{:#}", r.expect_err("must fail")).contains("already exists"));
 }
@@ -394,7 +406,13 @@ fn rm_removes_the_entry() {
     .0
     .expect("add");
 
-    let (r, io) = fx.run(Command::Rm { label: "Temp".to_owned() }, &[MASTER], &[&fx.code(&seed)]);
+    let (r, io) = fx.run(
+        Command::Rm {
+            label: "Temp".to_owned(),
+        },
+        &[MASTER],
+        &[&fx.code(&seed)],
+    );
     r.expect("rm");
     assert!(io.err_contains("Removed"));
 
@@ -426,7 +444,9 @@ fn wrong_master_password_fails_to_unlock() {
     let seed = fx.init();
     let (r, _io) = fx.run(Command::List, &["wrong-password"], &[&fx.code(&seed)]);
     assert!(r.is_err());
-    assert!(format!("{:#}", r.expect_err("must fail")).contains("incorrect master password or TOTP"));
+    assert!(
+        format!("{:#}", r.expect_err("must fail")).contains("incorrect master password or TOTP")
+    );
 }
 
 #[test]
@@ -455,7 +475,9 @@ fn passwd_changes_master_password() {
 
     // passwd: unlock (master + code), then current master + new (twice).
     let (r, io) = fx.run(
-        Command::Passwd { preset: Preset::Low },
+        Command::Passwd {
+            preset: Preset::Low,
+        },
         &[MASTER, MASTER, new_master, new_master],
         &[&fx.code(&seed)],
     );
@@ -476,7 +498,13 @@ fn export_refuses_weak_master_password() {
     // strength gate fires before TOTP re-auth and before the expensive recovery
     // Argon2, so this is cheap (only the cheap unlock runs a KDF).
     let fx = Fixture::new();
-    let (r, io) = fx.run(Command::Init { preset: Preset::Low }, &["weak", "weak"], &[]);
+    let (r, io) = fx.run(
+        Command::Init {
+            preset: Preset::Low,
+        },
+        &["weak", "weak"],
+        &[],
+    );
     r.expect("init with weak master");
     let seed = seed_from_uri(io.out_starting("otpauth://").expect("uri"));
 
@@ -526,11 +554,20 @@ fn import_round_trips_a_cheap_recovery_file() {
         }],
     };
     let recovery_pw = "Recover-Me-Str0ng-Passphrase!";
-    let file = fx.paths.vault().parent().expect("vault parent").join("backup.pmr");
+    let file = fx
+        .paths
+        .vault()
+        .parent()
+        .expect("vault parent")
+        .join("backup.pmr");
     std::fs::write(
         &file,
-        export_unchecked(&payload, &SecretString::new(recovery_pw.to_owned()), &FAST_KDF)
-            .expect("export file"),
+        export_unchecked(
+            &payload,
+            &SecretString::new(recovery_pw.to_owned()),
+            &FAST_KDF,
+        )
+        .expect("export file"),
     )
     .expect("write file");
 
@@ -544,7 +581,10 @@ fn import_round_trips_a_cheap_recovery_file() {
         &[],
     );
     r.expect("import");
-    assert!(io.out_starting("otpauth://").is_some(), "re-provisioning URI printed");
+    assert!(
+        io.out_starting("otpauth://").is_some(),
+        "re-provisioning URI printed"
+    );
 
     // The restored vault lists the imported entry; its seed (in the new URI)
     // unlocks it.

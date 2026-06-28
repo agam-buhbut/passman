@@ -110,10 +110,7 @@ where
 }
 
 /// Prompt for the master password and a TOTP code, then unlock.
-fn unlock<'a, H, I, C>(
-    app: &'a App<H>,
-    env: &mut CliEnv<I, C>,
-) -> Result<UnlockedApp<'a, H>>
+fn unlock<'a, H, I, C>(app: &'a App<H>, env: &mut CliEnv<I, C>) -> Result<UnlockedApp<'a, H>>
 where
     H: HardwareKeyStore<PlatformCtx = ()>,
     I: Io,
@@ -138,12 +135,12 @@ fn unlock_error(e: UnlockError) -> anyhow::Error {
         ),
         UnlockError::Cancelled => anyhow!("unlock cancelled"),
         UnlockError::Retryable => anyhow!("transient hardware error during unlock; please retry"),
-        UnlockError::RouteToRecovery => anyhow!(
-            "the hardware key is unavailable; recover with `passman import <file>`"
-        ),
-        UnlockError::SoftwareHsmRefused => anyhow!(
-            "this vault uses a software backend; pass --allow-software-hsm to proceed"
-        ),
+        UnlockError::RouteToRecovery => {
+            anyhow!("the hardware key is unavailable; recover with `passman import <file>`")
+        }
+        UnlockError::SoftwareHsmRefused => {
+            anyhow!("this vault uses a software backend; pass --allow-software-hsm to proceed")
+        }
         UnlockError::Hsm(_) | UnlockError::MalformedVault(_) => {
             anyhow!("the vault could not be unlocked (corrupt or tampered data)")
         }
@@ -165,7 +162,9 @@ where
         .next()
         .ok_or_else(|| anyhow!("no entry labelled {label:?}"))?;
     if matching.next().is_some() {
-        bail!("several entries are labelled {label:?}; labels must be unique to address one by name");
+        bail!(
+            "several entries are labelled {label:?}; labels must be unique to address one by name"
+        );
     }
     Ok(first.id)
 }
@@ -263,9 +262,8 @@ where
         )
         .context("could not create the vault")?;
 
-    env.io.err(
-        "Add this TOTP secret to your authenticator app NOW — it is shown only once:",
-    );
+    env.io
+        .err("Add this TOTP secret to your authenticator app NOW — it is shown only once:");
     env.io.out(uri.expose());
     env.io.err(&format!(
         "Vault created at {}.",
@@ -362,8 +360,11 @@ where
         "Copied to the clipboard; it will be cleared in {secs} s."
     ));
     env.io.sleep(env.clipboard_clear);
-    let outcome =
-        unlocked.clear_clipboard_with(&cookie, env.clipboard, env.settings.clipboard_fact_overwrite);
+    let outcome = unlocked.clear_clipboard_with(
+        &cookie,
+        env.clipboard,
+        env.settings.clipboard_fact_overwrite,
+    );
     env.io.err(&format!("Clipboard cleared ({outcome:?})."));
     Ok(())
 }
@@ -418,8 +419,7 @@ where
         )
         .map_err(export_error)?;
 
-    std::fs::write(file, &bytes)
-        .with_context(|| format!("could not write {}", file.display()))?;
+    std::fs::write(file, &bytes).with_context(|| format!("could not write {}", file.display()))?;
     env.io.err(&format!(
         "Recovery file written to {}. Store it somewhere safe.",
         file.display()
@@ -461,7 +461,8 @@ where
         .ensure_dirs()
         .context("could not create the vault directory")?;
 
-    let bytes = std::fs::read(file).with_context(|| format!("could not read {}", file.display()))?;
+    let bytes =
+        std::fs::read(file).with_context(|| format!("could not read {}", file.display()))?;
     let recovery_pw = env.io.read_secret("Recovery password: ")?;
 
     env.io
@@ -484,7 +485,11 @@ where
         "Vault restored to {} with {} entr{}.",
         env.paths.vault().display(),
         unlocked.list_entries()?.len(),
-        if unlocked.list_entries()?.len() == 1 { "y" } else { "ies" }
+        if unlocked.list_entries()?.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        }
     ));
     unlocked.lock();
     Ok(())

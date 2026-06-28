@@ -584,7 +584,7 @@ mod tests {
             self.probe_calls.load(Ordering::Relaxed)
         }
 
-        /// Zero-extend the 12-byte GCM IV to the 24-byte XChaCha20 nonce.
+        /// Zero-extend the 12-byte GCM IV to the 24-byte `XChaCha20` nonce.
         fn nonce_from_iv(iv: &[u8]) -> [u8; aead::NONCE_LEN] {
             let mut nonce = [0u8; aead::NONCE_LEN];
             nonce[..iv.len()].copy_from_slice(iv);
@@ -714,7 +714,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_trailing_bytes() {
-        let mut bytes = encode_payload("x", &sample_iv(), &vec![0u8; 16]).expect("encode");
+        let mut bytes = encode_payload("x", &sample_iv(), &[0u8; 16]).expect("encode");
         bytes.push(0xFF);
         let err = decode_payload(&bytes).expect_err("must reject");
         assert!(matches!(

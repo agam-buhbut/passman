@@ -71,6 +71,11 @@ keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 # generated from the system libtss2 headers via tss-esapi-sys/pkg-config.
 tss-esapi = { version = "7", default-features = false }
 
+# Process hardening (binary shells only — never in the pure library crates).
+# libc is already a transitive dep; declared directly here so the binary shells
+# can call prctl/setrlimit to suppress core dumps at startup (pentest S6).
+libc = "0.2"
+
 # Dev/test
 hex-literal = "0.4"
 tempfile = "3"

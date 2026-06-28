@@ -139,9 +139,7 @@ mod tests {
         // CI with no HOME), which is itself a valid `discover` outcome.
         if let Ok(p) = Paths::discover() {
             assert!(p.vault().ends_with(format!("passman/{VAULT_FILE}")));
-            assert!(p
-                .settings()
-                .ends_with(format!("passman/{SETTINGS_FILE}")));
+            assert!(p.settings().ends_with(format!("passman/{SETTINGS_FILE}")));
             assert!(p.log_dir().is_some_and(|d| d.ends_with("passman")));
         }
     }

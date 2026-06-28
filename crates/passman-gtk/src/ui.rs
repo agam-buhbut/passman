@@ -4,7 +4,7 @@
 //! All blocking work happens on the worker; the UI polls the response channel on
 //! the GTK main loop (every 50 ms) and only ever touches widgets here.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::rc::Rc;
@@ -12,15 +12,18 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gtk4 as gtk;
 use gtk::prelude::*;
 use gtk::{glib, Align, Application, ApplicationWindow, Orientation};
+use gtk4 as gtk;
 
 use passman_core::{App, EntryHandle, RevealField};
 use passman_crypto::{KdfParams, SecretString};
 use passman_hsm::linux::{select_linux_backend, LinuxKeyStore};
 use passman_platform::{Paths, Settings};
-use passman_policy::{generate, Charset, GenerationRequest, RequiredClasses};
+use passman_policy::{
+    estimate_master, generate, Charset, GenerationRequest, RequiredClasses, StrengthTier,
+    DEFAULT_LENGTH,
+};
 use passman_totp::{Clock, SystemClock};
 use passman_vault::EntryId;
 
@@ -118,10 +121,74 @@ pub fn run() -> anyhow::Result<ExitCode> {
     })
 }
 
+/// Show a minimal GTK error window when startup fails (finding UX-low / §5 item 5).
+///
+/// This is called from `main.rs` when `run()` returns an `Err` so the user gets
+/// a visible dialog instead of only a silent stderr print (e.g. when launched
+/// from a desktop shortcut with no terminal).
+pub fn show_startup_error(message: &str) {
+    // We need a bare GTK app to own the window; no application-id so it does
+    // not conflict with the real one on a re-launch.
+    let app = Application::builder().build();
+    let msg = message.to_owned();
+    app.connect_activate(move |app| {
+        let label = gtk::Label::builder()
+            .label(&msg)
+            .wrap(true)
+            .selectable(true)
+            .margin_top(16)
+            .margin_bottom(8)
+            .margin_start(16)
+            .margin_end(16)
+            .build();
+        let hint = gtk::Label::builder()
+            .label("Hint: if no TPM was found, relaunch with --allow-software-hsm")
+            .wrap(true)
+            .margin_bottom(16)
+            .margin_start(16)
+            .margin_end(16)
+            .build();
+        hint.add_css_class("dim-label");
+        let ok_btn = gtk::Button::with_label("Close");
+        ok_btn.set_margin_bottom(16);
+        ok_btn.set_margin_start(16);
+        ok_btn.set_margin_end(16);
+        let vbox = gtk::Box::new(Orientation::Vertical, 0);
+        vbox.append(&label);
+        vbox.append(&hint);
+        vbox.append(&ok_btn);
+        let window = ApplicationWindow::builder()
+            .application(app)
+            .title("passman — startup error")
+            .default_width(400)
+            .default_height(180)
+            .child(&vbox)
+            .build();
+        let win_close = window.clone();
+        ok_btn.connect_clicked(move |_| win_close.close());
+        window.present();
+    });
+    app.run_with_args::<&str>(&[]);
+}
+
+/// A pending mutation whose label we want to surface as a success confirmation.
+///
+/// After the user triggers Add or Remove we store the relevant label here so
+/// that when `Response::Entries` arrives we can display e.g. `Added "foo"`.
+#[derive(Debug, Clone)]
+enum PendingMutation {
+    Add(String),
+    Remove(String),
+}
+
 /// The live widget set + worker handle, shared into the GTK closures via `Rc`.
 struct Ui {
     stack: gtk::Stack,
     master: gtk::PasswordEntry,
+    /// Second password entry for the create-vault confirm step (finding UX-medium / §5 item 3).
+    create_confirm: gtk::PasswordEntry,
+    /// Non-blocking strength warning shown during create (finding UX-medium / §5 item 3).
+    create_strength: gtk::Label,
     totp: gtk::Entry,
     unlock_btn: gtk::Button,
     create_btn: gtk::Button,
@@ -140,6 +207,13 @@ struct Ui {
     vault_path: PathBuf,
     entries: RefCell<Vec<EntryHandle>>,
     selected: RefCell<Option<usize>>,
+    /// Set just before sending `Request::Lock`; cleared when the `Locked`
+    /// response is consumed.  Distinguishes a user-initiated lock from an
+    /// idle auto-lock so we can show a helpful message (finding UX-high / §5 item 2).
+    user_initiated_lock: Cell<bool>,
+    /// Label stored at the moment the user clicks Add or Remove, consumed when
+    /// the next `Response::Entries` arrives (finding UX-medium / §5 item 6).
+    pending_mutation: RefCell<Option<PendingMutation>>,
 }
 
 impl Ui {
@@ -149,18 +223,28 @@ impl Ui {
         self.entries.borrow().get(idx).map(|h| h.id)
     }
 
+    /// The label of the currently-selected entry, if any.
+    fn selected_label(&self) -> Option<String> {
+        let idx = (*self.selected.borrow())?;
+        self.entries.borrow().get(idx).map(|h| h.label.clone())
+    }
+
     /// Show the unlock controls when a vault exists, else the create controls.
     fn refresh_gate(&self) {
         let exists = self.vault_path.exists();
         self.totp.set_visible(exists);
         self.unlock_btn.set_visible(exists);
         self.create_btn.set_visible(!exists);
+        self.create_confirm.set_visible(!exists);
+        self.create_strength.set_visible(!exists);
         self.unlock_hint.set_text(if exists {
             "Unlock your vault."
         } else {
             "Welcome — choose a master password to create your vault."
         });
         self.master.set_text("");
+        self.create_confirm.set_text("");
+        self.create_strength.set_text("");
         self.totp.set_text("");
         self.unlock_error.set_text("");
     }
@@ -186,9 +270,32 @@ impl Ui {
     }
 }
 
+/// Return a human-readable tier label for a password strength tier.
+///
+/// Used on the create page to give non-blocking feedback (finding UX-medium / §5 item 3).
+fn tier_label(tier: StrengthTier) -> &'static str {
+    match tier {
+        StrengthTier::Dangerous => "Strength: Dangerous — choose a longer passphrase",
+        StrengthTier::Weak => "Strength: Weak — consider a longer passphrase",
+        StrengthTier::Acceptable => "Strength: Acceptable",
+        StrengthTier::Strong => "Strength: Strong",
+        StrengthTier::Excellent => "Strength: Excellent",
+    }
+}
+
+/// Whether the tier warrants a visible warning (below Strong).
+fn tier_needs_warning(tier: StrengthTier) -> bool {
+    !matches!(tier, StrengthTier::Strong | StrengthTier::Excellent)
+}
+
 /// Build the window and all wiring.
 #[allow(clippy::too_many_lines)] // cohesive widget construction; splitting hurts clarity
-fn build_ui(app: &Application, session: Session, responses: Receiver<Response>, vault_path: PathBuf) {
+fn build_ui(
+    app: &Application,
+    session: Session,
+    responses: Receiver<Response>,
+    vault_path: PathBuf,
+) {
     let vault_exists = vault_path.exists();
     let stack = gtk::Stack::new();
     stack.set_transition_type(gtk::StackTransitionType::SlideLeftRight);
@@ -197,6 +304,18 @@ fn build_ui(app: &Application, session: Session, responses: Receiver<Response>, 
     let master = gtk::PasswordEntry::builder()
         .show_peek_icon(true)
         .placeholder_text("Master password")
+        .build();
+    // Second entry for confirm (only shown on create, hidden on unlock).
+    let create_confirm = gtk::PasswordEntry::builder()
+        .show_peek_icon(true)
+        .placeholder_text("Confirm master password")
+        .visible(!vault_exists)
+        .build();
+    // Non-blocking strength label (only shown on create).
+    let create_strength = gtk::Label::builder()
+        .label("")
+        .wrap(true)
+        .visible(!vault_exists)
         .build();
     let totp = gtk::Entry::builder()
         .placeholder_text("TOTP code")
@@ -233,6 +352,8 @@ fn build_ui(app: &Application, session: Session, responses: Receiver<Response>, 
     unlock_box.append(&title);
     unlock_box.append(&unlock_hint);
     unlock_box.append(&master);
+    unlock_box.append(&create_confirm);
+    unlock_box.append(&create_strength);
     unlock_box.append(&totp);
     unlock_box.append(&unlock_btn);
     unlock_box.append(&create_btn);
@@ -247,7 +368,10 @@ fn build_ui(app: &Application, session: Session, responses: Receiver<Response>, 
         .vexpand(true)
         .child(&list)
         .build();
-    let reveal = gtk::Label::builder().label(OBSCURED).selectable(true).build();
+    let reveal = gtk::Label::builder()
+        .label(OBSCURED)
+        .selectable(true)
+        .build();
     let status = gtk::Label::builder().label("").wrap(true).build();
 
     let reveal_btn = gtk::Button::with_label("Reveal");
@@ -289,8 +413,12 @@ fn build_ui(app: &Application, session: Session, responses: Receiver<Response>, 
         .placeholder_text("Password")
         .build();
     let gen_btn = gtk::Button::with_label("Generate");
-    let add_url = gtk::Entry::builder().placeholder_text("URL (optional)").build();
-    let add_notes = gtk::Entry::builder().placeholder_text("Notes (optional)").build();
+    let add_url = gtk::Entry::builder()
+        .placeholder_text("URL (optional)")
+        .build();
+    let add_notes = gtk::Entry::builder()
+        .placeholder_text("Notes (optional)")
+        .build();
     let save_btn = gtk::Button::with_label("Save");
     save_btn.add_css_class("suggested-action");
     let cancel_btn = gtk::Button::with_label("Cancel");
@@ -329,6 +457,8 @@ fn build_ui(app: &Application, session: Session, responses: Receiver<Response>, 
     let ui = Rc::new(Ui {
         stack,
         master,
+        create_confirm: create_confirm.clone(),
+        create_strength: create_strength.clone(),
         totp,
         unlock_btn: unlock_btn.clone(),
         create_btn: create_btn.clone(),
@@ -347,12 +477,22 @@ fn build_ui(app: &Application, session: Session, responses: Receiver<Response>, 
         vault_path,
         entries: RefCell::new(Vec::new()),
         selected: RefCell::new(None),
+        user_initiated_lock: Cell::new(false),
+        pending_mutation: RefCell::new(None),
     });
 
     wire_unlock(&ui, &unlock_btn);
-    wire_create(&ui, &create_btn);
+    wire_create(&ui, &create_btn, &create_confirm);
     wire_list_selection(&ui, &list);
-    wire_vault_actions(&ui, &reveal_btn, &copy_pw_btn, &copy_user_btn, &remove_btn, &lock_btn, &add_btn);
+    wire_vault_actions(
+        &ui,
+        &reveal_btn,
+        &copy_pw_btn,
+        &copy_user_btn,
+        &remove_btn,
+        &lock_btn,
+        &add_btn,
+    );
     wire_add_page(&ui, &gen_btn, &save_btn, &cancel_btn);
     attach_response_poll(&ui, responses);
 
@@ -371,22 +511,69 @@ fn wire_unlock(ui: &Rc<Ui>, unlock_btn: &gtk::Button) {
     });
 }
 
-fn wire_create(ui: &Rc<Ui>, create_btn: &gtk::Button) {
-    let ui = Rc::clone(ui);
-    create_btn.connect_clicked(move |_| {
-        let master = SecretString::new(ui.master.text().to_string());
-        if master.expose().is_empty() {
-            ui.unlock_error.set_text("Choose a master password first.");
-            return;
-        }
-        ui.unlock_error.set_text("");
-        ui.unlock_spinner.set_spinning(true);
-        ui.create_btn.set_sensitive(false);
-        ui.session.send(Request::Create {
-            master,
-            kdf: KdfParams::MEDIUM,
+fn wire_create(ui: &Rc<Ui>, create_btn: &gtk::Button, create_confirm: &gtk::PasswordEntry) {
+    // Live strength estimate as the user types (non-blocking, finding UX-medium / §5 item 3).
+    {
+        let ui_strength = Rc::clone(ui);
+        // Clone the widget handle out of Ui so we can borrow it for
+        // `connect_changed` without also moving `ui_strength` for the method
+        // call — the closure captures `ui_strength` by move.
+        let master_widget = ui.master.clone();
+        master_widget.connect_changed(move |entry| {
+            let text = entry.text();
+            if text.is_empty() {
+                ui_strength.create_strength.set_text("");
+                return;
+            }
+            // Only show strength feedback when we are on the create page
+            // (create_strength is hidden during unlock).
+            if !ui_strength.create_strength.is_visible() {
+                return;
+            }
+            let est = estimate_master(text.as_str(), &[], &KdfParams::MEDIUM);
+            ui_strength.create_strength.set_text(tier_label(est.tier));
+            if tier_needs_warning(est.tier) {
+                ui_strength.create_strength.add_css_class("warning");
+            } else {
+                ui_strength.create_strength.remove_css_class("warning");
+            }
         });
-    });
+    }
+    {
+        let ui = Rc::clone(ui);
+        let create_confirm = create_confirm.clone();
+        create_btn.connect_clicked(move |_| {
+            let master = SecretString::new(ui.master.text().to_string());
+            if master.expose().is_empty() {
+                ui.unlock_error.set_text("Choose a master password first.");
+                return;
+            }
+            // Confirm must match (finding UX-medium / §5 item 3).
+            let confirm = create_confirm.text();
+            if master.expose() != confirm.as_str() {
+                ui.unlock_error
+                    .set_text("The passwords do not match — re-enter both.");
+                return;
+            }
+            // Non-blocking weakness warning: warn but do not block creation
+            // (mirrors CLI behaviour in commands.rs `warn_if_weak`).
+            let est = estimate_master(master.expose(), &[], &KdfParams::MEDIUM);
+            if tier_needs_warning(est.tier) {
+                ui.create_strength.set_text(&format!(
+                    "Warning: {} — vault will still be created.",
+                    tier_label(est.tier)
+                ));
+                ui.create_strength.add_css_class("warning");
+            }
+            ui.unlock_error.set_text("");
+            ui.unlock_spinner.set_spinning(true);
+            ui.create_btn.set_sensitive(false);
+            ui.session.send(Request::Create {
+                master,
+                kdf: KdfParams::MEDIUM,
+            });
+        });
+    }
 }
 
 fn wire_list_selection(ui: &Rc<Ui>, list: &gtk::ListBox) {
@@ -411,7 +598,10 @@ fn wire_vault_actions(
         let ui = Rc::clone(ui);
         reveal_btn.connect_clicked(move |_| {
             if let Some(id) = ui.selected_id() {
-                ui.session.send(Request::Reveal { id, field: RevealField::Password });
+                ui.session.send(Request::Reveal {
+                    id,
+                    field: RevealField::Password,
+                });
             }
         });
     }
@@ -419,7 +609,10 @@ fn wire_vault_actions(
         let ui = Rc::clone(ui);
         copy_pw_btn.connect_clicked(move |_| {
             if let Some(id) = ui.selected_id() {
-                ui.session.send(Request::Copy { id, field: RevealField::Password });
+                ui.session.send(Request::Copy {
+                    id,
+                    field: RevealField::Password,
+                });
             }
         });
     }
@@ -427,7 +620,10 @@ fn wire_vault_actions(
         let ui = Rc::clone(ui);
         copy_user_btn.connect_clicked(move |_| {
             if let Some(id) = ui.selected_id() {
-                ui.session.send(Request::Copy { id, field: RevealField::Username });
+                ui.session.send(Request::Copy {
+                    id,
+                    field: RevealField::Username,
+                });
             }
         });
     }
@@ -435,6 +631,11 @@ fn wire_vault_actions(
         let ui = Rc::clone(ui);
         remove_btn.connect_clicked(move |_| {
             if let Some(id) = ui.selected_id() {
+                // Record the label before the remove for the success confirmation
+                // (finding UX-medium / §5 item 6).
+                if let Some(label) = ui.selected_label() {
+                    *ui.pending_mutation.borrow_mut() = Some(PendingMutation::Remove(label));
+                }
                 ui.session.send(Request::Remove { id });
             }
         });
@@ -442,6 +643,9 @@ fn wire_vault_actions(
     {
         let ui = Rc::clone(ui);
         lock_btn.connect_clicked(move |_| {
+            // Mark as user-initiated so `Response::Locked` can distinguish it
+            // from an idle auto-lock (finding UX-high / §5 item 2).
+            ui.user_initiated_lock.set(true);
             ui.session.send(Request::Lock);
         });
     }
@@ -454,11 +658,22 @@ fn wire_vault_actions(
     }
 }
 
-fn wire_add_page(ui: &Rc<Ui>, gen_btn: &gtk::Button, save_btn: &gtk::Button, cancel_btn: &gtk::Button) {
+fn wire_add_page(
+    ui: &Rc<Ui>,
+    gen_btn: &gtk::Button,
+    save_btn: &gtk::Button,
+    cancel_btn: &gtk::Button,
+) {
     {
         let ui = Rc::clone(ui);
         gen_btn.connect_clicked(move |_| {
-            let req = GenerationRequest::new(24, Charset::default_vault(), RequiredClasses::one_of_each());
+            // Use the shared DEFAULT_LENGTH constant so GTK and CLI generate
+            // the same strength (finding UX-medium / §5 item 4).
+            let req = GenerationRequest::new(
+                DEFAULT_LENGTH,
+                Charset::default_vault(),
+                RequiredClasses::one_of_each(),
+            );
             if let Ok(pw) = generate(&req) {
                 ui.add_pass.set_text(pw.expose());
             }
@@ -473,6 +688,8 @@ fn wire_add_page(ui: &Rc<Ui>, gen_btn: &gtk::Button, save_btn: &gtk::Button, can
                 ui.stack.set_visible_child_name("vault");
                 return;
             }
+            // Record the label for the success confirmation (finding UX-medium / §5 item 6).
+            *ui.pending_mutation.borrow_mut() = Some(PendingMutation::Add(label.clone()));
             ui.session.send(Request::Add {
                 label,
                 username: SecretString::new(ui.add_user.text().to_string()),
@@ -521,14 +738,27 @@ fn handle_response(ui: &Rc<Ui>, response: Response) {
             ui.unlock_spinner.set_spinning(false);
             ui.create_btn.set_sensitive(true);
             ui.master.set_text("");
+            ui.create_confirm.set_text("");
+            ui.create_strength.set_text("");
             ui.set_entries(entries);
-            // Show the one-time TOTP secret so the user can add it to their
-            // authenticator app. It is sensitive (it embeds the seed); selectable
-            // so the user can copy the otpauth:// URI.
+            // Show the one-time TOTP provisioning URI so the user can scan it in
+            // their authenticator app. It is sensitive (it embeds the seed).
+            // Auto-hide on the same timer as a revealed secret (finding S7 / §5 item 1).
             ui.reveal.set_text(provisioning_uri.expose());
-            ui.status
-                .set_text("Vault created. Add this TOTP secret to your authenticator now — it is shown only once.");
+            ui.status.set_text(
+                "Vault created. Scan this TOTP URI in your authenticator now — \
+                 it hides automatically in 10 s. Click \"Done\" when saved.",
+            );
             ui.stack.set_visible_child_name("vault");
+            // Start the auto-hide timer (mirrors the Revealed handler, §5.4).
+            let ui_hide = Rc::clone(ui);
+            glib::timeout_add_seconds_local(REVEAL_HIDE_SECS, move || {
+                ui_hide.reveal.set_text(OBSCURED);
+                ui_hide.status.set_text(
+                    "TOTP URI hidden. If you did not save it, lock and recreate the vault.",
+                );
+                glib::ControlFlow::Break
+            });
         }
         Response::CreateFailed { message } => {
             ui.unlock_spinner.set_spinning(false);
@@ -549,8 +779,18 @@ fn handle_response(ui: &Rc<Ui>, response: Response) {
             ui.unlock_error.set_text(&message);
         }
         Response::Entries { entries } => {
+            // Surface the success message for the most recent Add/Remove before
+            // the list is rebuilt (finding UX-medium / §5 item 6).
+            let confirmation = ui.pending_mutation.borrow_mut().take().map(|m| match m {
+                PendingMutation::Add(label) => format!("Added \"{label}\"."),
+                PendingMutation::Remove(label) => format!("Removed \"{label}\"."),
+            });
             ui.set_entries(entries);
-            ui.status.set_text("");
+            if let Some(msg) = confirmation {
+                ui.status.set_text(&msg);
+            } else {
+                ui.status.set_text("");
+            }
         }
         Response::Revealed { field, value } => {
             ui.reveal.set_text(value.expose());
@@ -563,8 +803,9 @@ fn handle_response(ui: &Rc<Ui>, response: Response) {
             });
         }
         Response::Copied { cookie } => {
-            ui.status
-                .set_text(&format!("Copied — auto-clears in {CLIPBOARD_CLEAR_SECS} s."));
+            ui.status.set_text(&format!(
+                "Copied — auto-clears in {CLIPBOARD_CLEAR_SECS} s."
+            ));
             let ui_clear = Rc::clone(ui);
             glib::timeout_add_seconds_local(CLIPBOARD_CLEAR_SECS, move || {
                 ui_clear.session.send(Request::ClearClipboard { cookie });
@@ -576,14 +817,70 @@ fn handle_response(ui: &Rc<Ui>, response: Response) {
             ui.add_pass.set_text(password.expose());
         }
         Response::Locked => {
+            let was_user_initiated = ui.user_initiated_lock.get();
+            // Consume the flag before touching other UI state.
+            ui.user_initiated_lock.set(false);
+
             ui.set_entries(Vec::new());
             ui.status.set_text("");
             // A vault may have just been created; re-evaluate create-vs-unlock.
             ui.refresh_gate();
             ui.stack.set_visible_child_name("unlock");
+
+            // If the lock was NOT user-initiated, it came from the 120 s idle
+            // auto-lock; tell the user why they were thrown back to this screen
+            // (finding UX-high / §5 item 2).
+            if !was_user_initiated {
+                ui.unlock_error.set_text(
+                    "Locked automatically after 2 minutes of inactivity — \
+                     unlock to continue.",
+                );
+            }
         }
         Response::Error { message } => {
             ui.status.set_text(&message);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{tier_label, tier_needs_warning, StrengthTier};
+
+    #[test]
+    fn tier_label_covers_all_variants() {
+        // Every variant must return a non-empty string.
+        for tier in [
+            StrengthTier::Dangerous,
+            StrengthTier::Weak,
+            StrengthTier::Acceptable,
+            StrengthTier::Strong,
+            StrengthTier::Excellent,
+        ] {
+            assert!(!tier_label(tier).is_empty(), "empty label for {tier:?}");
+        }
+    }
+
+    #[test]
+    fn tier_needs_warning_matches_allows_export() {
+        // needs_warning is true exactly when the tier is below Strong —
+        // the same boundary the CLI uses for `warn_if_weak` (commands.rs).
+        for tier in [
+            StrengthTier::Dangerous,
+            StrengthTier::Weak,
+            StrengthTier::Acceptable,
+        ] {
+            assert!(tier_needs_warning(tier), "expected warning for {tier:?}");
+        }
+        for tier in [StrengthTier::Strong, StrengthTier::Excellent] {
+            assert!(!tier_needs_warning(tier), "unexpected warning for {tier:?}");
+        }
+    }
+
+    #[test]
+    fn default_length_matches_policy_constant() {
+        // The generate button uses DEFAULT_LENGTH; this pins it to 40 so
+        // GTK and CLI are always aligned (finding UX-medium / §5 item 4).
+        assert_eq!(super::DEFAULT_LENGTH, 40);
     }
 }

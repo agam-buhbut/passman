@@ -1,6 +1,7 @@
 package com.passman.app
 
 import android.os.Bundle
+import android.view.WindowManager
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -11,26 +12,40 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import java.io.File
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import uniffi.passman_uniffi.AppException
 import uniffi.passman_uniffi.EntryItem
 import uniffi.passman_uniffi.FieldKind
 import uniffi.passman_uniffi.KdfChoice
@@ -42,6 +57,13 @@ private enum class Screen { GATE, VAULT }
 class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Block screenshots, screen recording, and the recents/app-switcher
+        // snapshot — the revealed password and the plaintext TOTP seed are
+        // on screen (threats #5/#16).
+        window.setFlags(
+            WindowManager.LayoutParams.FLAG_SECURE,
+            WindowManager.LayoutParams.FLAG_SECURE,
+        )
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
@@ -56,27 +78,73 @@ class MainActivity : FragmentActivity() {
 private fun PassmanRoot(activity: FragmentActivity) {
     val scope = rememberCoroutineScope()
     val vaultFile = remember { File(activity.filesDir, "vault.pmv") }
-    val app = remember {
-        PassmanApp.open(
-            vaultFile.absolutePath,
-            KeystoreBridgeImpl(activity.applicationContext, requireAuth = true) { activity },
-            ClipboardBridgeImpl(activity.applicationContext),
-            factOverwrite = true,
-        )
+    // Defense-in-depth: never crash the whole app if opening the vault fails.
+    // `open` can return AppError.Setup (e.g. the lockfile cannot be created);
+    // surface it on a screen instead of letting the exception escape remember{}
+    // and kill composition.
+    val appResult = remember {
+        runCatching {
+            PassmanApp.open(
+                vaultFile.absolutePath,
+                KeystoreBridgeImpl(activity.applicationContext, requireAuth = true) { activity },
+                ClipboardBridgeImpl(activity.applicationContext),
+                factOverwrite = true,
+            )
+        }
+    }
+    val app = appResult.getOrNull()
+    if (app == null) {
+        StartupErrorScreen(appResult.exceptionOrNull()?.message ?: "Could not open passman.")
+        return
     }
 
     var screen by remember { mutableStateOf(Screen.GATE) }
     var entries by remember { mutableStateOf(listOf<EntryItem>()) }
     var status by remember { mutableStateOf("") }
     var revealed by remember { mutableStateOf("") }
+    var inFlight by remember { mutableStateOf(false) }
 
-    fun run(block: suspend () -> Unit) = scope.launch {
-        status = "Working…"
+    // The pending clipboard auto-clear; a fresh copy cancels the prior one so we
+    // never wipe a newer clip after the older clip's 30 s elapses.
+    val clearJob = remember { mutableStateOf<Job?>(null) }
+
+    // Lock on backgrounding: ON_STOP drops the keys immediately instead of
+    // waiting out the 120 s session timeout, and returns to the gate.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) {
+                runCatching { app.lock() }
+                clearJob.value?.cancel()
+                clearJob.value = null
+                entries = listOf()
+                revealed = ""
+                screen = Screen.GATE
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    fun run(working: String = "Working…", block: suspend () -> Unit) = scope.launch {
+        inFlight = true
+        status = working
         try {
             withContext(Dispatchers.IO) { block() }
-            status = ""
+            // Preserve a terminal message the block set (e.g. the copy notice);
+            // otherwise clear the in-progress status.
+            if (status == working) status = ""
+        } catch (t: AppException.SessionLocked) {
+            // The session timed out (or was locked). Return to the gate instead
+            // of leaving the user on the vault screen issuing locked-state ops.
+            entries = listOf()
+            revealed = ""
+            screen = Screen.GATE
+            status = "Session locked — unlock again."
         } catch (t: Throwable) {
             status = t.message ?: "Error"
+        } finally {
+            inFlight = false
         }
     }
 
@@ -84,8 +152,9 @@ private fun PassmanRoot(activity: FragmentActivity) {
         Screen.GATE -> GateScreen(
             vaultExists = vaultFile.exists(),
             status = status,
+            inFlight = inFlight,
             onCreate = { master ->
-                run {
+                run("Deriving the vault key — this is deliberately slow…") {
                     val uri = app.createVault(master, KdfChoice.MEDIUM)
                     entries = app.list()
                     revealed = uri
@@ -93,7 +162,7 @@ private fun PassmanRoot(activity: FragmentActivity) {
                 }
             },
             onUnlock = { master, code ->
-                run {
+                run("Deriving the vault key — this is deliberately slow…") {
                     entries = app.unlock(master, code)
                     screen = Screen.VAULT
                 }
@@ -103,18 +172,38 @@ private fun PassmanRoot(activity: FragmentActivity) {
             entries = entries,
             status = status,
             revealed = revealed,
+            inFlight = inFlight,
             onReveal = { item ->
                 run { revealed = app.reveal(item.id, FieldKind.PASSWORD) }
             },
             onCopy = { item ->
-                run { app.copy(item.id, FieldKind.PASSWORD); status = "Copied" }
+                run {
+                    // Capture the cookie digest on the IO dispatcher (run{} wraps
+                    // the whole block in withContext(IO)), then hop to the main
+                    // thread to touch Compose state: clearJob is a mutableStateOf,
+                    // and its cancel/reassign — plus the status write — must not run
+                    // off the main thread. scope.launch defaults to Main, so the
+                    // 30 s auto-clear job is created from the main-dispatched body.
+                    val digest = app.copy(item.id, FieldKind.PASSWORD)
+                    withContext(Dispatchers.Main) {
+                        clearJob.value?.cancel()
+                        clearJob.value = scope.launch {
+                            delay(30_000)
+                            withContext(Dispatchers.IO) { app.clearClipboard(digest) }
+                        }
+                        status = "Copied — clears in 30 s"
+                    }
+                }
             },
             onAdd = { label, user, pass ->
                 run { entries = app.add(label, user, pass, "", "") }
             },
+            onClearRevealed = { revealed = "" },
             onLock = {
                 run {
                     app.lock()
+                    clearJob.value?.cancel()
+                    clearJob.value = null
                     entries = listOf()
                     revealed = ""
                     screen = Screen.GATE
@@ -125,9 +214,18 @@ private fun PassmanRoot(activity: FragmentActivity) {
 }
 
 @Composable
+private fun StartupErrorScreen(message: String) {
+    Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text("passman couldn't start", style = MaterialTheme.typography.headlineSmall)
+        Text(message)
+    }
+}
+
+@Composable
 private fun GateScreen(
     vaultExists: Boolean,
     status: String,
+    inFlight: Boolean,
     onCreate: (String) -> Unit,
     onUnlock: (String, String) -> Unit,
 ) {
@@ -140,12 +238,21 @@ private fun GateScreen(
             visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(),
         )
         if (vaultExists) {
-            OutlinedTextField(code, { code = it }, label = { Text("TOTP code") }, modifier = Modifier.fillMaxWidth())
-            Button({ onUnlock(master, code) }, Modifier.fillMaxWidth()) { Text("Unlock") }
+            OutlinedTextField(
+                code, { code = it }, label = { Text("TOTP code") },
+                modifier = Modifier.fillMaxWidth(),
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Number,
+                    imeAction = ImeAction.Done,
+                ),
+                keyboardActions = KeyboardActions(onDone = { onUnlock(master, code) }),
+            )
+            Button({ onUnlock(master, code) }, Modifier.fillMaxWidth(), enabled = !inFlight) { Text("Unlock") }
         } else {
             Text("No vault yet — create one.")
-            Button({ onCreate(master) }, Modifier.fillMaxWidth()) { Text("Create vault") }
+            Button({ onCreate(master) }, Modifier.fillMaxWidth(), enabled = !inFlight) { Text("Create vault") }
         }
+        if (inFlight) CircularProgressIndicator()
         if (status.isNotEmpty()) Text(status)
     }
 }
@@ -155,14 +262,31 @@ private fun VaultScreen(
     entries: List<EntryItem>,
     status: String,
     revealed: String,
+    inFlight: Boolean,
     onReveal: (EntryItem) -> Unit,
     onCopy: (EntryItem) -> Unit,
     onAdd: (String, String, String) -> Unit,
+    onClearRevealed: () -> Unit,
     onLock: () -> Unit,
 ) {
     var label by remember { mutableStateOf("") }
     var user by remember { mutableStateOf("") }
     var pass by remember { mutableStateOf("") }
+    val isProvisioningUri = revealed.startsWith("otpauth://")
+
+    // A password reveal is obscured by default; tapping toggles it visible.
+    // Reset to hidden whenever a new value is revealed.
+    var showRevealed by remember(revealed) { mutableStateOf(false) }
+
+    // Auto-hide a revealed password after 10 s (mirrors GTK). The one-time
+    // otpauth provisioning URI is exempt — it is dismissed manually (item 6).
+    LaunchedEffect(revealed) {
+        if (revealed.isNotEmpty() && !isProvisioningUri) {
+            delay(10_000)
+            onClearRevealed()
+        }
+    }
+
     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Text("Vault (${entries.size})", style = MaterialTheme.typography.titleLarge)
@@ -171,12 +295,18 @@ private fun VaultScreen(
         if (revealed.isNotEmpty()) {
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (revealed.startsWith("otpauth://")) {
+                    if (isProvisioningUri) {
                         Text("Scan with your authenticator app (shown once):")
                         QrCode(revealed, Modifier.size(220.dp))
                         Text(revealed, style = MaterialTheme.typography.bodySmall)
+                        Button(onClearRevealed, Modifier.fillMaxWidth()) {
+                            Text("Done — I've added it to my authenticator")
+                        }
                     } else {
-                        Text(revealed)
+                        Text(if (showRevealed) revealed else "••••••••")
+                        TextButton({ showRevealed = !showRevealed }) {
+                            Text(if (showRevealed) "Hide" else "Show")
+                        }
                     }
                 }
             }
@@ -187,8 +317,8 @@ private fun VaultScreen(
                     Row(Modifier.padding(12.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                         Text(item.label)
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            Button({ onReveal(item) }) { Text("Reveal") }
-                            Button({ onCopy(item) }) { Text("Copy") }
+                            Button({ onReveal(item) }, enabled = !inFlight) { Text("Reveal") }
+                            Button({ onCopy(item) }, enabled = !inFlight) { Text("Copy") }
                         }
                     }
                 }
@@ -198,7 +328,12 @@ private fun VaultScreen(
         OutlinedTextField(label, { label = it }, label = { Text("Label") }, modifier = Modifier.fillMaxWidth())
         OutlinedTextField(user, { user = it }, label = { Text("Username") }, modifier = Modifier.fillMaxWidth())
         OutlinedTextField(pass, { pass = it }, label = { Text("Password") }, modifier = Modifier.fillMaxWidth())
-        Button({ onAdd(label, user, pass); label = ""; user = ""; pass = "" }, Modifier.fillMaxWidth()) { Text("Add") }
+        Button(
+            { onAdd(label, user, pass); label = ""; user = ""; pass = "" },
+            Modifier.fillMaxWidth(),
+            enabled = !inFlight,
+        ) { Text("Add") }
+        if (inFlight) CircularProgressIndicator()
         if (status.isNotEmpty()) Text(status)
     }
 }

@@ -11,6 +11,7 @@ import androidx.fragment.app.FragmentActivity
 import java.security.KeyStore
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -204,7 +205,10 @@ class KeystoreBridgeImpl(
                 .build()
             prompt.authenticate(info, BiometricPrompt.CryptoObject(cipher))
         }
-        latch.await()
+        // Bound the wait: if the BiometricPrompt callback never fires (e.g. the
+        // activity is recreated), await() would otherwise block forever. On
+        // timeout, fail the op cleanly as a transient cancellation.
+        if (!latch.await(60, TimeUnit.SECONDS)) throw KeystoreFailure.Cancelled()
         failure?.let { throw it }
     }
 

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=passman
+GenericName=Password Manager
+Comment=Local-only, hardware-backed password manager
+Exec=@BIN@
+Icon=dialog-password
+Terminal=false
+Categories=Utility;Security;GTK;
+Keywords=password;vault;secret;security;totp;
+StartupNotify=true

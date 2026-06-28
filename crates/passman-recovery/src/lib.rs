@@ -33,10 +33,10 @@ mod payload;
 mod reader;
 
 pub use error::RecoveryError;
+#[cfg(feature = "test-util")]
+pub use format::export_unchecked;
 pub use format::{
     export, import, FORMAT_VERSION, KDF_ALGORITHM_ARGON2ID, MAGIC, RECOVERY_AD, SALT_LEN,
 };
-#[cfg(feature = "test-util")]
-pub use format::export_unchecked;
 pub use kdf::{meets_floor, RecoveryPreset, FLOOR_PARAMS, RECOVERY_INFO};
 pub use payload::{ExportPayload, RecoveryEntry, ENTRY_ID_LEN, PAYLOAD_VERSION, TOTP_SEED_LEN};

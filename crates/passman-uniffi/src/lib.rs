@@ -246,8 +246,14 @@ fn callback_io(_: CallbackError) -> passman_core::CoreError {
 
 impl passman_core::Clipboard for ClipboardAdapter {
     fn write(&self, secret: &SecretString) -> Result<ClipboardCookie, passman_core::CoreError> {
-        let digest = self.0.write(secret.expose().to_owned()).map_err(callback_io)?;
-        Ok(ClipboardCookie::new(fixed_digest(digest)?, SystemClock.now()))
+        let digest = self
+            .0
+            .write(secret.expose().to_owned())
+            .map_err(callback_io)?;
+        Ok(ClipboardCookie::new(
+            fixed_digest(digest)?,
+            SystemClock.now(),
+        ))
     }
 
     fn read_digest(&self) -> Result<Option<[u8; DIGEST_LEN]>, passman_core::CoreError> {
@@ -435,7 +441,9 @@ impl PassmanApp {
             master: SecretString::new(master),
             code,
         }) {
-            Response::Unlocked { entries } => Ok(entries.into_iter().map(EntryItem::from).collect()),
+            Response::Unlocked { entries } => {
+                Ok(entries.into_iter().map(EntryItem::from).collect())
+            }
             Response::UnlockFailed { message } => Err(AppError::Failed { detail: message }),
             other => Err(unexpected(&other)),
         }
@@ -554,6 +562,11 @@ impl PassmanApp {
     /// Send one request and wait for the worker's single response, serialized.
     fn call(&self, request: Request) -> Response {
         let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        // Discard any unsolicited responses (notably a proactive auto-lock
+        // `Locked` emitted on the §5.2 idle timeout) so our `recv` lines up
+        // one-to-one with the request we are about to send. Without this, a
+        // spontaneous response would desync every subsequent call.
+        while inner.responses.try_recv().is_ok() {}
         inner.session.send(request);
         inner.responses.recv().unwrap_or(Response::Error {
             message: "the session worker has stopped".to_owned(),
@@ -596,3 +609,133 @@ fn unexpected(response: &Response) -> AppError {
 /// `JNI_OnLoad`).
 #[uniffi::export]
 pub fn android_init() {}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        entry_id, fixed_digest, unexpected, AppError, EntryItem, FieldKind, KdfChoice,
+        KeystoreFailure, SecurityLevel,
+    };
+    use passman_core::worker::Response;
+    use passman_core::{EntryHandle, RevealField};
+    use passman_crypto::KdfParams;
+    use passman_hsm::{KeystoreError, KeystoreSecurityLevel};
+    use passman_vault::EntryId;
+
+    #[test]
+    fn entry_id_requires_exactly_16_bytes() {
+        assert!(entry_id(&[0u8; 16]).is_ok());
+        for bad in [0usize, 15, 17, 32] {
+            assert!(
+                matches!(entry_id(&vec![0u8; bad]), Err(AppError::Failed { .. })),
+                "len {bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_digest_requires_exactly_32_bytes() {
+        assert!(fixed_digest(vec![0u8; 32]).is_ok());
+        assert!(fixed_digest(vec![0u8; 31]).is_err());
+        assert!(fixed_digest(vec![0u8; 33]).is_err());
+        assert!(fixed_digest(vec![]).is_err());
+    }
+
+    #[test]
+    fn kdf_choice_maps_to_the_preset_params() {
+        for (choice, preset) in [
+            (KdfChoice::Low, KdfParams::LOW),
+            (KdfChoice::Medium, KdfParams::MEDIUM),
+            (KdfChoice::High, KdfParams::HIGH),
+        ] {
+            let p = choice.params();
+            assert_eq!((p.m_kib, p.t, p.p), (preset.m_kib, preset.t, preset.p));
+        }
+    }
+
+    #[test]
+    fn field_kind_maps_to_reveal_field() {
+        assert!(matches!(
+            RevealField::from(FieldKind::Username),
+            RevealField::Username
+        ));
+        assert!(matches!(
+            RevealField::from(FieldKind::Password),
+            RevealField::Password
+        ));
+        assert!(matches!(
+            RevealField::from(FieldKind::Url),
+            RevealField::Url
+        ));
+        assert!(matches!(
+            RevealField::from(FieldKind::Notes),
+            RevealField::Notes
+        ));
+    }
+
+    #[test]
+    fn keystore_failure_maps_to_host_error() {
+        assert!(matches!(
+            KeystoreError::from(KeystoreFailure::Cancelled),
+            KeystoreError::Cancelled
+        ));
+        assert!(matches!(
+            KeystoreError::from(KeystoreFailure::Lockout),
+            KeystoreError::Lockout
+        ));
+        assert!(matches!(
+            KeystoreError::from(KeystoreFailure::KeyInvalidated),
+            KeystoreError::KeyInvalidated
+        ));
+        assert!(matches!(
+            KeystoreError::from(KeystoreFailure::AuthFailed),
+            KeystoreError::AuthFailed
+        ));
+        assert!(matches!(
+            KeystoreError::from(KeystoreFailure::Backend),
+            KeystoreError::Backend
+        ));
+    }
+
+    #[test]
+    fn security_level_maps_to_host() {
+        assert!(matches!(
+            KeystoreSecurityLevel::from(SecurityLevel::StrongBox),
+            KeystoreSecurityLevel::StrongBox
+        ));
+        assert!(matches!(
+            KeystoreSecurityLevel::from(SecurityLevel::TrustedEnvironment),
+            KeystoreSecurityLevel::TrustedEnvironment
+        ));
+        assert!(matches!(
+            KeystoreSecurityLevel::from(SecurityLevel::Software),
+            KeystoreSecurityLevel::Software
+        ));
+    }
+
+    #[test]
+    fn unexpected_routes_a_locked_response_to_session_locked() {
+        // Defensive: even a response that arrives out of turn must surface a
+        // lock as SessionLocked, never a generic failure.
+        assert!(matches!(
+            unexpected(&Response::Locked),
+            AppError::SessionLocked
+        ));
+        assert!(matches!(
+            unexpected(&Response::Error {
+                message: "x".to_owned()
+            }),
+            AppError::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn entry_handle_converts_to_entry_item() {
+        let item = EntryItem::from(EntryHandle {
+            id: EntryId::from_bytes([7u8; 16]),
+            label: "GitHub".to_owned(),
+        });
+        assert_eq!(item.id, vec![7u8; 16]);
+        assert_eq!(item.label, "GitHub");
+    }
+}

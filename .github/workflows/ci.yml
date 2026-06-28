@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The §2.4 / §9.5 merge gate: format, lints, architectural boundaries, tests,
+  # and the supply-chain checks. The toolchain is pinned by rust-toolchain.toml.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System libraries (gtk4, TPM2, dbus)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libtss2-dev libdbus-1-dev
+      - name: Toolchain
+        run: rustup show && rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy (pedantic + unwrap_used, deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Architectural boundaries (§2.2 / §2.4)
+        run: ./scripts/check-boundaries.sh
+      - name: Tests
+        run: cargo test --workspace
+      - name: cargo-audit (RUSTSEC)
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit
+      - name: cargo-deny (licenses / bans / sources / advisories)
+        run: |
+          cargo install cargo-deny --version 0.19.9 --locked
+          cargo deny check
+
+  # §10 / §9.5: parser fuzzing gates merges. A bounded smoke run per top-attack-
+  # surface parser; a crash writes an artifact and fails the job.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libtss2-dev libdbus-1-dev
+      - name: Nightly + cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src
+          cargo install cargo-fuzz --version 0.13.2 --locked
+      - uses: Swatinem/rust-cache@v2
+      - name: Fuzz the vault parser (smoke)
+        run: cd crates/passman-vault && cargo +nightly fuzz run vault_parse -- -max_total_time=60 -rss_limit_mb=2048 -timeout=10
+      - name: Fuzz the recovery parser (smoke)
+        run: cd crates/passman-recovery && cargo +nightly fuzz run recovery_import -- -max_total_time=60 -rss_limit_mb=2048 -timeout=10
+
+  # End-to-end CLI smoke against a software TPM (the real TPM2 backend, isolated
+  # in a tempdir). Skips gracefully if swtpm is unavailable.
+  swtpm-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System libraries (TPM2 + swtpm)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libtss2-dev libdbus-1-dev swtpm swtpm-tools tpm2-tools python3
+      - name: Toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the CLI (tpm2 backend)
+        run: cargo build --release -p passman-cli
+      - name: Smoke test against swtpm
+        run: ./scripts/smoke-cli-swtpm.sh ./target/release/passman
+
+  # S8 fix: the RELEASE.md claim that CI runs reproduce.sh twice and diffs the
+  # hashes.  Two independent checkouts → two builds → SHA-256 comparison.
+  build-twice:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: passman-a
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libtss2-dev libdbus-1-dev pkg-config
+      - name: Toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: passman-a -> passman-a/target
+      - name: First build
+        working-directory: passman-a
+        run: SOURCE_DATE_EPOCH=1700000000 ./reproduce.sh | tee /tmp/hash-a.txt
+      - name: Copy checkout (exclude target/)
+        run: |
+          mkdir -p /tmp/passman-b
+          rsync -a --exclude='target/' passman-a/ /tmp/passman-b/
+      - name: Second build
+        working-directory: /tmp/passman-b
+        run: SOURCE_DATE_EPOCH=1700000000 ./reproduce.sh | tee /tmp/hash-b.txt
+      - name: Diff the two hashes
+        run: |
+          echo "=== build A ===" && cat /tmp/hash-a.txt
+          echo "=== build B ===" && cat /tmp/hash-b.txt
+          if diff <(awk '{print $1}' /tmp/hash-a.txt) <(awk '{print $1}' /tmp/hash-b.txt); then
+            echo "REPRODUCIBLE: hashes match"
+          else
+            echo "FAILURE: hashes differ — binary is not reproducible" >&2
+            exit 1
+          fi
+
+  # Supply-chain fix: verify gradle-wrapper.jar against Gradle's known-good list.
+  gradle-wrapper-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: gradle/actions/wrapper-validation@v4

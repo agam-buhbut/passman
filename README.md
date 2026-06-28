@@ -64,6 +64,24 @@ Run `passman --help` or `passman <command> --help` for everything else
 
 You need **Rust ≥ 1.95** (`rustup` recommended). Everything builds from this repo.
 
+### Quick install (Linux) — one command
+
+```console
+./install.sh              # builds + installs the CLI and the desktop app
+./install.sh --cli-only   # just the `passman` command-line tool
+```
+
+`install.sh` checks for the Rust toolchain and (for the GUI) the GTK 4 libraries,
+builds release binaries, installs them to `~/.local/bin` (no root), and adds a
+desktop launcher. Then:
+
+```console
+passman init              # create your vault (prints a one-time TOTP setup link)
+```
+
+Prefer to build by hand, or building one component? The per-component steps
+follow.
+
 ### CLI
 
 ```console
@@ -114,6 +132,27 @@ cd android && ./gradlew :app:assembleDebug     # or: gradle :app:assembleDebug
 
 The phone app stores its vault in app-private storage and shows the TOTP setup
 as a **scannable QR code** on vault creation.
+
+---
+
+## Verify your download
+
+Release artifacts are published with a signed checksum file. **minisign is the
+primary signature**; a GPG signature is also provided. Verify before installing:
+
+```console
+# 1. minisign (primary) — uses the published public key.
+minisign -Vm SHA-256SUMS -P <passman minisign public key>
+# 2. GPG (secondary) — after importing the published key.
+gpg --verify SHA-256SUMS.asc SHA-256SUMS
+# 3. confirm your file matches the signed checksums.
+sha256sum --check SHA-256SUMS
+```
+
+The core binary is also **reproducible** — run `./reproduce.sh` and compare its
+SHA-256 to the published one. Full signing/verification details, key
+fingerprints, and the Android APK certificate pin are in
+[`docs/RELEASE.md`](docs/RELEASE.md).
 
 ---
 

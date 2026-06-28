@@ -11,14 +11,14 @@ use hmac::{Hmac, Mac};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
-use passman_core::{App, Clipboard, ClipboardCookie, CoreError, RevealField};
-use passman_crypto::{KdfParams, SecretString};
 use passman_core::worker::{Request, Response};
 use passman_core::Session;
+use passman_core::{App, Clipboard, ClipboardCookie, CoreError, RevealField};
+use passman_crypto::{KdfParams, SecretString};
 use passman_hsm::mock::{MockKeyStore, MockPrompter};
 use passman_hsm::{
-    BiometricPrompter, HardwareKeyStore, HsmCapabilities, HsmError, HsmKind, HsmSlot, UnwrapHandle,
-    WrappedBlob,
+    BiometricPrompter, HardwareKeyStore, HsmCapabilities, HsmError, HsmKind, HsmSlot, PromptResult,
+    UnwrapHandle, WrappedBlob,
 };
 use passman_policy::EntryPolicy;
 use passman_totp::{Clock, Timestamp, TotpConfig};
@@ -106,6 +106,22 @@ impl Clipboard for SharedClipboard {
     }
 }
 
+// ----- A prompter that can be parked mid-unlock (deterministic, no sleeps) ----
+
+struct BlockingPrompter {
+    entered: std::sync::mpsc::Sender<()>,
+    release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+impl BiometricPrompter for BlockingPrompter {
+    fn prompt(&self, _reason: String) -> Result<PromptResult, HsmError> {
+        let _ = self.entered.send(());
+        if let Some(rx) = self.release.lock().expect("lock").take() {
+            let _ = rx.recv(); // park here until the test releases (or drops) us
+        }
+        Ok(PromptResult::Authenticated)
+    }
+}
+
 // ----- Test clock + TOTP -----------------------------------------------------
 
 struct TestClock(AtomicU64);
@@ -115,6 +131,9 @@ impl TestClock {
     }
     fn now_secs(&self) -> u64 {
         self.0.load(Ordering::SeqCst)
+    }
+    fn advance(&self, secs: u64) {
+        self.0.fetch_add(secs, Ordering::SeqCst);
     }
 }
 impl Clock for TestClock {
@@ -159,9 +178,12 @@ impl Harness {
         let clock = TestClock::at(1_700_000_000);
 
         let seed = {
-            let app =
-                App::open_allowing_software_hsm(&path, backend.clone(), clock.clone() as Arc<dyn Clock>)
-                    .expect("open");
+            let app = App::open_allowing_software_hsm(
+                &path,
+                backend.clone(),
+                clock.clone() as Arc<dyn Clock>,
+            )
+            .expect("open");
             let prompter = MockPrompter::authenticating();
             let (mut unlocked, uri) = app
                 .create_vault(&master(), FAST_KDF, TotpConfig::default(), &(), &prompter)
@@ -245,6 +267,108 @@ fn unlock_lists_entries() {
 }
 
 #[test]
+fn requests_after_lock_get_a_locked_response_not_a_deadlock() {
+    // Regression: once the session locks (explicit lock, or a lazy 120 s expiry)
+    // the worker returns to its locked outer loop. Previously that loop silently
+    // dropped every request except Create/Unlock/Quit, sending no response — so a
+    // synchronous request→response caller (the UniFFI `call()`) blocked forever
+    // on recv() and froze the whole app. Every locked-state op must now get a
+    // `Locked` reply (and ClearClipboard, which is fire-and-forget, must NOT add
+    // a stray response that would desync the next caller).
+    let (h, seed) = Harness::with_entries(&["GitHub"]);
+    let (session, rx) = h.spawn();
+    session.send(Request::Unlock {
+        master: master(),
+        code: h.code(&seed),
+    });
+    assert!(matches!(recv(&rx), Response::Unlocked { .. }));
+
+    // Lock → worker is now parked in the locked outer loop.
+    session.send(Request::Lock);
+    assert!(matches!(recv(&rx), Response::Locked));
+
+    // A request while locked must be answered, not dropped.
+    session.send(Request::Refresh);
+    assert!(matches!(recv(&rx), Response::Locked));
+
+    // ClearClipboard is fire-and-forget: it must produce NO response, so the
+    // next request→response pair still lines up one-to-one.
+    session.send(Request::ClearClipboard {
+        cookie: ClipboardCookie::new([0u8; 32], Timestamp::from_unix_secs(0)),
+    });
+    session.send(Request::Generate { length: 16 });
+    assert!(matches!(recv(&rx), Response::Locked));
+}
+
+#[test]
+fn an_idle_session_auto_locks_after_the_timeout() {
+    // §5.2: a hard 120 s timeout. The worker must proactively lock an idle
+    // unlocked session even with no request driving it — otherwise K_master and
+    // the decrypted index stay resident until the user happens to act (the GTK
+    // exposure the audit flagged).
+    let (h, seed) = Harness::with_entries(&["GitHub"]);
+    let (session, rx) = h.spawn();
+    session.send(Request::Unlock {
+        master: master(),
+        code: h.code(&seed),
+    });
+    assert!(matches!(recv(&rx), Response::Unlocked { .. }));
+
+    // Jump past the 120 s expiry WITHOUT sending any request.
+    h.clock.advance(121);
+
+    // The worker must notice and lock on its own, with no op to trigger it.
+    assert!(matches!(recv(&rx), Response::Locked));
+}
+
+#[test]
+fn dropping_the_session_does_not_block_on_a_stuck_worker() {
+    use std::sync::mpsc::channel;
+
+    // A hung biometric/HSM op must not freeze the UI when the session is dropped
+    // (e.g. on app shutdown). The worker is parked inside the unlock prompt, then
+    // we assert Session::drop still returns promptly.
+    let (h, seed) = Harness::with_entries(&["X"]);
+    let (entered_tx, entered_rx) = channel::<()>();
+    let (release_tx, release_rx) = channel::<()>();
+
+    let app = App::open_allowing_software_hsm(
+        &h.path,
+        h.backend.clone(),
+        h.clock.clone() as Arc<dyn Clock>,
+    )
+    .expect("open");
+    let clip = h.clip.clone();
+    let prompter = Box::new(BlockingPrompter {
+        entered: entered_tx,
+        release: Mutex::new(Some(release_rx)),
+    });
+    let (session, _rx) = Session::spawn(app, move || Ok(clip), prompter, true);
+
+    session.send(Request::Unlock {
+        master: master(),
+        code: h.code(&seed),
+    });
+    // Deterministic barrier: proceed only once the worker is stuck in the prompt.
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("worker should reach the prompt");
+
+    // Drop on a helper thread; the main thread asserts it completed quickly.
+    let (done_tx, done_rx) = channel::<()>();
+    std::thread::spawn(move || {
+        drop(session);
+        let _ = done_tx.send(());
+    });
+    assert!(
+        done_rx.recv_timeout(Duration::from_secs(3)).is_ok(),
+        "Session::drop blocked on a stuck worker"
+    );
+
+    let _ = release_tx.send(()); // let the parked worker unwind cleanly
+}
+
+#[test]
 fn wrong_password_fails_unlock() {
     let (h, seed) = Harness::with_entries(&["X"]);
     let (session, rx) = h.spawn();
@@ -287,6 +411,110 @@ fn reveal_and_copy_a_field() {
     assert_eq!(
         h.clip.content.lock().expect("lock").as_deref(),
         Some("pw-GitHub")
+    );
+}
+
+#[test]
+fn locking_wipes_a_still_live_clipboard_secret() {
+    // Pentest S4: after a Copy, the GTK shell schedules a ClearClipboard 30 s
+    // later. But if the session locks first (explicit Lock, or the 120 s idle
+    // auto-lock) the worker returns to its locked outer loop, which DROPS that
+    // later ClearClipboard — leaving the copied password on the OS clipboard
+    // indefinitely for a clipboard scraper (threat #4). The lock transition must
+    // therefore proactively wipe a still-live clipboard cookie itself.
+    let (h, seed) = Harness::with_entries(&["GitHub"]);
+    let (session, rx) = h.spawn();
+    session.send(Request::Unlock {
+        master: master(),
+        code: h.code(&seed),
+    });
+    let id = match recv(&rx) {
+        Response::Unlocked { entries } => entries[0].id,
+        other => panic!("expected Unlocked, got {other:?}"),
+    };
+
+    // Copy the password → the secret lands on the shared clipboard.
+    session.send(Request::Copy {
+        id,
+        field: RevealField::Password,
+    });
+    assert!(matches!(recv(&rx), Response::Copied { .. }));
+    assert_eq!(
+        h.clip.content.lock().expect("lock").as_deref(),
+        Some("pw-GitHub"),
+        "the copied secret should be on the clipboard"
+    );
+
+    // Force the 120 s idle auto-lock BEFORE any ClearClipboard is sent — this is
+    // exactly the race the GTK 30 s timer loses.
+    h.clock.advance(121);
+    assert!(matches!(recv(&rx), Response::Locked));
+
+    // The lock transition must have wiped the secret off the clipboard. With
+    // fact_overwrite=true the content becomes a non-secret "facts" string; the
+    // load-bearing assertion is simply that it is NO LONGER the password.
+    assert_ne!(
+        h.clip.content.lock().expect("lock").as_deref(),
+        Some("pw-GitHub"),
+        "locking must have wiped the still-live clipboard secret"
+    );
+}
+
+#[test]
+fn quitting_wipes_a_still_live_clipboard_secret() {
+    // Pentest S4 (Quit variant): after a Copy, the GTK shell schedules a
+    // ClearClipboard 30 s later. If the user QUITS within that window (an explicit
+    // Request::Quit while unlocked, or the worker's response channel disconnecting)
+    // the worker exits its unlocked loop and the UnlockedApp drops — but the
+    // pending ClearClipboard never runs, stranding the copied password on the OS
+    // clipboard for a scraper. The Quit transition must wipe a still-live cookie
+    // exactly as the Lock transition does.
+    let (h, seed) = Harness::with_entries(&["GitHub"]);
+    let (session, rx) = h.spawn();
+    session.send(Request::Unlock {
+        master: master(),
+        code: h.code(&seed),
+    });
+    let id = match recv(&rx) {
+        Response::Unlocked { entries } => entries[0].id,
+        other => panic!("expected Unlocked, got {other:?}"),
+    };
+
+    // Copy the password → the secret lands on the shared clipboard.
+    session.send(Request::Copy {
+        id,
+        field: RevealField::Password,
+    });
+    assert!(matches!(recv(&rx), Response::Copied { .. }));
+    assert_eq!(
+        h.clip.content.lock().expect("lock").as_deref(),
+        Some("pw-GitHub"),
+        "the copied secret should be on the clipboard"
+    );
+
+    // Quit within the 30 s clear window, BEFORE any ClearClipboard is sent.
+    session.send(Request::Quit);
+
+    // Deterministic barrier: the worker drops the Response sender (closing `rx`)
+    // only after it has fully returned — i.e. after the Quit-path wipe has run.
+    // Block until that disconnect instead of sleeping.
+    loop {
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(_) => {} // drain any straggler response
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("worker did not exit within 5s after Quit")
+            }
+        }
+    }
+
+    // The Quit transition must have wiped the secret off the clipboard (fact
+    // overwrite leaves a non-secret string); the load-bearing assertion is that
+    // it is NO LONGER the password.
+    assert_ne!(
+        h.clip.content.lock().expect("lock").as_deref(),
+        Some("pw-GitHub"),
+        "quitting must have wiped the still-live clipboard secret"
     );
 }
 
@@ -350,8 +578,8 @@ fn create_makes_a_vault_and_returns_the_provisioning_uri() {
     let path = dir.path().join("vault.pmv");
     let backend = SharedMock::new();
     let clock = TestClock::at(1_700_000_000);
-    let app = App::open_allowing_software_hsm(&path, backend, clock as Arc<dyn Clock>)
-        .expect("open");
+    let app =
+        App::open_allowing_software_hsm(&path, backend, clock as Arc<dyn Clock>).expect("open");
     let clip = SharedClipboard::default();
     let (session, rx) = Session::spawn(
         app,

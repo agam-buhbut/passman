@@ -1,0 +1,28 @@
+# cargo-fuzz harness for the recovery-file parser (architecture.md §10, §9.5).
+# Own workspace so the stable parent build never pulls the fuzz toolchain.
+[package]
+name = "passman-recovery-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.passman-recovery]
+path = ".."
+
+[dependencies.passman-crypto]
+path = "../../passman-crypto"
+
+[[bin]]
+name = "recovery_import"
+path = "fuzz_targets/recovery_import.rs"
+test = false
+doc = false
+bench = false

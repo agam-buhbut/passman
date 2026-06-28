@@ -286,6 +286,17 @@ impl<H: HardwareKeyStore> App<H> {
         }
 
         // Step 4: verify the TOTP code against the long-lived verifier.
+        //
+        // SECURITY (accepted trade-off): a wrong TOTP code returns here
+        // *before* the Argon2 KDF (step 5), so a timing side-channel leaks
+        // which factor was wrong — fast exit → bad TOTP; slow exit → bad
+        // password.  This is a deliberate DoS-resistance choice: running the
+        // expensive Argon2 on every attempt (including those with a trivially
+        // wrong TOTP) would let any unauthenticated caller force multi-second
+        // CPU work per request.  The leaked information ("your TOTP was wrong")
+        // is low-value to an attacker who already lacks both the TOTP seed and
+        // the master password; distinguishing the two failure modes does not
+        // meaningfully advance a brute-force attack.
         if self.verify_totp(seed.expose(), totp_code).is_err() {
             self.record_failure(&mut vault, &mut state, now);
             return Err(UnlockError::BadCredentials);

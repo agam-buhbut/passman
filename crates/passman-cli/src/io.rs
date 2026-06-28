@@ -10,6 +10,7 @@ use std::io::{self, BufRead, Write};
 use std::time::Duration;
 
 use passman_crypto::SecretString;
+use zeroize::Zeroize;
 
 /// The terminal/clock surface a command needs.
 ///
@@ -62,6 +63,12 @@ impl Io for TerminalIo {
         if stdin.is_terminal() {
             Ok(SecretString::new(rpassword::read_password()?))
         } else {
+            // SECURITY: read into a plain String (there is no zeroizing
+            // BufRead alternative in std), then explicitly zeroize it after
+            // moving the trimmed content into SecretString.  The trimmed
+            // copy is immediately wrapped in SecretString which zeroizes on
+            // drop; the original buffer (with the trailing newline) is
+            // scrubbed here so no plain-text copy lingers in freed heap.
             let mut line = String::new();
             if stdin.lock().read_line(&mut line)? == 0 {
                 return Err(io::Error::new(
@@ -69,9 +76,7 @@ impl Io for TerminalIo {
                     "unexpected end of input",
                 ));
             }
-            Ok(SecretString::new(
-                line.trim_end_matches(['\n', '\r']).to_owned(),
-            ))
+            Ok(finalize_secret_line(line))
         }
     }
 
@@ -100,5 +105,48 @@ impl Io for TerminalIo {
 
     fn sleep(&mut self, dur: Duration) {
         std::thread::sleep(dur);
+    }
+}
+
+/// Finalize a freshly-read secret line: strip the trailing line terminator,
+/// wrap the result in a zeroizing [`SecretString`], and scrub the original
+/// buffer so no plaintext copy lingers in freed heap. Factored out of the
+/// non-tty `read_secret` branch so the trim/wrap logic is unit-testable without
+/// a real stdin.
+fn finalize_secret_line(mut line: String) -> SecretString {
+    let trimmed = line.trim_end_matches(['\n', '\r']).to_owned();
+    line.zeroize();
+    SecretString::new(trimmed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::finalize_secret_line;
+
+    /// The non-tty `read_secret` path ends in `finalize_secret_line`: it must
+    /// strip a trailing `\n` / `\r\n`, return the secret intact, and (per the
+    /// `// SECURITY:` comment) zeroize the source buffer. Deterministic — does
+    /// not touch real stdin, so it is stable under `cargo test` in any
+    /// environment.
+    #[test]
+    fn finalize_secret_line_strips_terminator_and_wraps() {
+        assert_eq!(
+            finalize_secret_line("hunter2\n".to_owned()).expose(),
+            "hunter2"
+        );
+        assert_eq!(
+            finalize_secret_line("hunter2\r\n".to_owned()).expose(),
+            "hunter2"
+        );
+        assert_eq!(
+            finalize_secret_line("no-terminator".to_owned()).expose(),
+            "no-terminator"
+        );
+        assert_eq!(finalize_secret_line(String::new()).expose(), "");
+        // Only the trailing terminator is stripped; embedded whitespace stays.
+        assert_eq!(
+            finalize_secret_line("a b\tc\n".to_owned()).expose(),
+            "a b\tc"
+        );
     }
 }

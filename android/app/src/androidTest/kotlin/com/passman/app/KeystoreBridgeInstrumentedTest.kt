@@ -2,13 +2,16 @@ package com.passman.app
 
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import java.io.File
 import java.util.UUID
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.fail
 import org.junit.Test
 import org.junit.runner.RunWith
 import uniffi.passman_uniffi.KeystoreFailure
+import uniffi.passman_uniffi.PassmanApp
 
 /**
  * On-device verification of the `KeystoreBridgeImpl` against the **real** Android
@@ -114,5 +117,32 @@ class KeystoreBridgeInstrumentedTest {
         // Kotlin -> Rust -> Kotlin FFI call. Throws (UnsatisfiedLinkError /
         // UniFFI checksum mismatch) if the native bridge is broken on-device.
         uniffi.passman_uniffi.androidInit()
+    }
+
+    @Test
+    fun open_on_a_fresh_vault_path_does_not_throw() {
+        // Regression for the crash-on-launch: App::open acquires a single-
+        // instance lock via std's File::try_lock, which is unconditionally
+        // `Unsupported` on Android (its cfg list omits target_os="android").
+        // That error propagated to AppError.Setup and crashed the app on open,
+        // because MainActivity calls PassmanApp.open inside remember{} with no
+        // catch. The fix degrades the advisory lock to a no-op when the platform
+        // reports Unsupported; open() must therefore succeed here. This is the
+        // exact path the other tests never exercised.
+        val vault = File(ctx.filesDir, "open-regression-${UUID.randomUUID()}.pmv")
+        val lock = File(vault.absolutePath + ".lock")
+        try {
+            val app =
+                PassmanApp.open(
+                    vault.absolutePath,
+                    KeystoreBridgeImpl(ctx, requireAuth = false) { null },
+                    ClipboardBridgeImpl(ctx),
+                    factOverwrite = true,
+                )
+            assertNotNull("open() must return an app, not crash", app)
+        } finally {
+            vault.delete()
+            lock.delete()
+        }
     }
 }

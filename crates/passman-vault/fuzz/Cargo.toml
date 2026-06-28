@@ -1,0 +1,26 @@
+# cargo-fuzz harness for the vault binary parser (architecture.md §10, §9.5).
+# Its own workspace (empty [workspace]) so the stable-pinned parent build never
+# pulls in libfuzzer-sys / the nightly fuzz toolchain.
+[package]
+name = "passman-vault-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.passman-vault]
+path = ".."
+
+[[bin]]
+name = "vault_parse"
+path = "fuzz_targets/vault_parse.rs"
+test = false
+doc = false
+bench = false

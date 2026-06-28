@@ -549,6 +549,12 @@ impl<'a, H: passman_hsm::HardwareKeyStore> UnlockedApp<'a, H> {
         }
     }
 
+    /// Whether the session has passed its hard expiry. Lets the worker
+    /// proactively auto-lock an idle session (§5.2) without running an op.
+    pub(crate) fn is_expired(&self) -> bool {
+        self.now() >= self.session_expiry
+    }
+
     /// Current time as Unix seconds (`u64`).
     fn now(&self) -> u64 {
         self.app.clock().now().as_unix_secs()

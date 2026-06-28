@@ -332,6 +332,8 @@ Parsing rules: read exactly `entries_count` envelopes; EOF-before-count or trail
 
 The **security control is the platform HSM's own dictionary-attack protection** — TPM 2.0 DA lockout, Android Keystore auth-bound key attempt limits, Windows NCrypt anti-hammering. These enforce state an attacker who holds `K_hsm` cannot rewrite, which is the only kind of rate-limit that binds a post-unwrap attacker. `HsmCapabilities` (§6.1) surfaces `max_attempts_before_lockout` and `lockout_recovery` so the UI can explain platform behavior.
 
+**Backend reality — the DA lockout only engages where the key is genuinely auth-bound.** Android Keystore per-use auth (§6.4) binds it; **the shipped default Linux TPM2 backend does not.** It seals `K_hsm` and the TOTP seed as null-auth `KEYEDHASH` objects (no per-vault `authValue`), so an unseal never fails and the TPM's DA counter never increments — the hardware DA lockout therefore does **not** trigger on the default desktop. There, the throttle on online guessing is the **Argon2id work factor (§4.8 floor) plus a strong master password**, with the advisory timer below as the rest; `max_attempts_before_lockout` is reported as `None` so the UI can say so. MAC'ing the advisory counter with an HSM-derived key would **not** fix this: the in-scope attacker holds the device and can null-auth-unwrap `K_hsm`, so they could forge any HSM-keyed MAC and still roll the counter back. The genuine fix — binding a per-vault `authValue` (a PIN derived from the master password) to the TPM2 objects so wrong attempts hammer the TPM DA counter — is tracked as future work (§13).
+
 On top of that, `passman-core` keeps an **advisory** timer implementing the schedule below, purely for **consistent cross-platform UX messaging** (and as the only (weak) backstop on the SecretService fallback, where there is no hardware DA — documented as weak there). The advisory counter/last-failure live in the vault header in plaintext. It is **explicitly not a security boundary**: an attacker with the file can roll it back or (after unwrap) ignore it. We do not HMAC it with an HSM-derived key, because doing so would falsely imply it is a control.
 
 Advisory schedule: `lockout_minutes(n) = if n < 3 { 0 } else if n >= 11 { 1440 } else { min(10 * 2^(n-3), 1440) }` (the `n >= 11` guard prevents shift overflow). Rejection predicate: reject while `clock.now() < rl_last_failure + lockout_minutes(rl_counter) * 60`. A negative delta (clock moved backward) is clamped to "remain locked for the maximum remaining" (fail-closed). Counter resets to 0 on success.
@@ -745,7 +747,7 @@ No auto-update. The default binary makes **no network connections, ever**. An op
 | 12 | Nonce reuse | Critical | XChaCha20 192-bit random nonces; fresh per encryption; per-entry keys |
 | 13 | Weak Argon2 params | High | 256 MiB / 0.6 s floor; warning below Medium |
 | 14 | HSM extraction/cloning | Critical | Accepted (platform hardware guarantee) |
-| 15 | Online guessing past the HSM | Medium | **HSM-native DA lockout** (the real control); advisory app timer for UX. App counter is explicitly not a security boundary |
+| 15 | Online guessing past the HSM | Medium | **HSM-native DA lockout** where the key is auth-bound (Android Keystore). **The default Linux TPM2 backend seals null-auth, so its DA lockout does NOT engage** (§4.9) — there the throttle is Argon2id cost + a strong master password + the advisory timer (rollback-able; not a security boundary). TPM2 `authValue` binding is future work (§13) |
 | 16 | Mobile process introspection | High | `FLAG_SECURE`, snapshot suppression; rooted device accepted |
 | 17 | File-format downgrade | Medium | Version in AEAD AD; probe AD binds params; mismatch aborts |
 | 18 | Sealed-index size leakage | Low | 256-byte bucket padding; rewrite-on-save |
@@ -803,6 +805,7 @@ No auto-update. The default binary makes **no network connections, ever**. An op
 
 ## 13. Open items / future work
 
+- **TPM2 `authValue` binding for genuine hardware DA lockout:** the default Linux TPM2 backend currently seals `K_hsm`/the TOTP seed null-auth, so the TPM dictionary-attack counter never engages (§4.9). Binding a per-vault `authValue` (a PIN derived from the master password) to the sealed objects would make wrong unseals hammer the TPM DA counter — the real rate-limit against online guessing on desktop. Until then the throttle is Argon2id cost + master-password strength.
 - **iOS:** full Secure Enclave implementation and SwiftUI front-end (designed for, deferred).
 - **Windows native UI:** v0 uses `egui`; a native WinUI/`windows-rs` front-end is a later improvement.
 - **`cargo vet` gating:** advisory in v0, hard gate later.

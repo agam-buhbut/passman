@@ -30,6 +30,8 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 rpassword = { workspace = true }
 arboard = { workspace = true }
+# Core-dump suppression at process startup (pentest S6); only called from main.rs.
+libc = { workspace = true }
 # SHA-256 for the clipboard cookie digest (§5.3: the platform Clipboard impl
 # computes the digest; core never hashes). Already in the workspace lockfile.
 sha2 = { workspace = true }

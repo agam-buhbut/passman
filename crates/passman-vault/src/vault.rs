@@ -20,9 +20,23 @@ use crate::index::{entry_info, Index, IndexEntry, INDEX_INFO};
 use crate::reader::Reader;
 use crate::record::EntryRecord;
 
-/// The vault format version this build produces and accepts (`architecture.md`
-/// §4.7 / §4.10).
-pub const FORMAT_VERSION: u8 = 0x01;
+/// The vault format version this build produces (`architecture.md` §4.7 /
+/// §4.10).
+///
+/// `0x02` introduced bucket padding of the sealed index (the per-envelope
+/// bodies were already padded). The only on-disk difference from `0x01` is the
+/// sealed-index *plaintext* encoding: under `0x02` it is `true_len(u32-LE) ‖
+/// postcard ‖ zero-pad` to a [`INDEX_BUCKET`] multiple, so the
+/// `sealed_index_ct_len` field no longer leaks the sum of label/policy byte
+/// lengths (threat #18 / §4.5). The version is AD-bound into every AEAD, so the
+/// index decrypt path keys its plaintext decoding off the stored version.
+pub const FORMAT_VERSION: u8 = 0x02;
+
+/// The previous vault format version, still accepted on read for backward
+/// compatibility. Its sealed index is unpadded raw postcard (`architecture.md`
+/// §4.10: "mismatch aborts loudly" applies to *unknown* versions only — a known
+/// prior version is read with its own rules).
+const FORMAT_VERSION_LEGACY_V1: u8 = 0x01;
 
 /// `kdf_algorithm_id` for Argon2id (`architecture.md` §4.7).
 pub const KDF_ALGORITHM_ARGON2ID: u8 = 0x00;
@@ -382,11 +396,7 @@ impl Vault {
     /// - [`VaultError::EntryNotFound`] if no entry has `id`.
     /// - [`VaultError::Crypto`] / [`VaultError::MalformedRecord`] if re-sealing
     ///   the index fails.
-    pub fn remove_entry(
-        &mut self,
-        k_master: &MasterKey,
-        id: &EntryId,
-    ) -> Result<(), VaultError> {
+    pub fn remove_entry(&mut self, k_master: &MasterKey, id: &EntryId) -> Result<(), VaultError> {
         let before = self.envelopes.len();
         self.envelopes.retain(|e| &e.id != id);
         if self.envelopes.len() == before {
@@ -421,24 +431,36 @@ impl Vault {
 
     /// Decrypt the sealed index without the envelope-set check (internal: the
     /// mutation path needs the rows but rebuilds the set itself).
+    ///
+    /// The decrypted plaintext encoding depends on the stored format version,
+    /// which is bound into the AEAD AD: a `0x02` index is bucket-padded
+    /// (`true_len(u32-LE) ‖ postcard ‖ zero-pad`) and the padding is stripped
+    /// here; a legacy `0x01` index is raw postcard and parsed directly. The
+    /// padding strip rejects a `true_len` exceeding the (authenticated) buffer
+    /// (it cannot be reached without an AEAD-tag forgery, but is surfaced rather
+    /// than trusted).
     fn decrypt_index(&self, k_master: &MasterKey) -> Result<Index, VaultError> {
         let key = hkdf_expand(k_master, INDEX_INFO);
         let ad = [self.format_version];
         let plaintext = aead::decrypt(&key, &self.sealed_index_nonce, &ad, &self.sealed_index_ct)
             .map_err(auth_failure)?;
+        let postcard_bytes = if self.format_version == FORMAT_VERSION_LEGACY_V1 {
+            // Legacy: the plaintext is raw postcard with no padding.
+            plaintext.expose()
+        } else {
+            // Current: strip the authenticated bucket padding via the in-plaintext
+            // true-length prefix.
+            strip_index_padding(plaintext.expose())?
+        };
         let rows: Vec<IndexEntry> =
-            postcard::from_bytes(plaintext.expose()).map_err(|_| VaultError::MalformedRecord {
+            postcard::from_bytes(postcard_bytes).map_err(|_| VaultError::MalformedRecord {
                 reason: "sealed index is not valid postcard",
             })?;
         Ok(Index::from_vec(rows))
     }
 
     /// Re-encrypt `index` under a fresh nonce and store it.
-    fn reseal_index(
-        &mut self,
-        index: &Index,
-        k_master: &MasterKey,
-    ) -> Result<(), VaultError> {
+    fn reseal_index(&mut self, index: &Index, k_master: &MasterKey) -> Result<(), VaultError> {
         let (nonce, ct) = seal_index(index, k_master)?;
         self.sealed_index_nonce = nonce;
         self.sealed_index_ct = ct;
@@ -548,7 +570,11 @@ impl Vault {
         let mut r = Reader::new(bytes);
 
         let format_version = r.read_u8("format_version")?;
-        if format_version != FORMAT_VERSION {
+        // Accept the current version and the one prior version. The stored
+        // version drives the sealed-index decode (padded vs unpadded) in
+        // `decrypt_index`; both are AD-bound so a tampered version byte fails
+        // the AEAD on the probe/index/entry paths.
+        if format_version != FORMAT_VERSION && format_version != FORMAT_VERSION_LEGACY_V1 {
             return Err(VaultError::UnsupportedVersion {
                 got: format_version,
                 expected: FORMAT_VERSION,
@@ -667,21 +693,82 @@ fn entry_associated_data(format_version: u8, id: &EntryId) -> [u8; 1 + ENTRY_ID_
     ad
 }
 
-/// Seal an index: postcard-serialize the rows and AEAD-encrypt under `K_index`
-/// with `ad = [format_version]`, using a fresh nonce. Returns `(nonce, ct)`.
+/// Index padding bucket. The sealed index is bucket-padded exactly as the
+/// per-entry envelopes are (see [`crate::record::BUCKET`]); reusing that
+/// constant keeps both quantizations identical, so the sealed-index ciphertext
+/// length reveals only a 256-byte size class instead of the exact sum of
+/// label/policy byte lengths (threat #18 / §4.5).
+const INDEX_BUCKET: usize = crate::record::BUCKET;
+
+/// Seal an index (`FORMAT_VERSION` = `0x02`): postcard-serialize the rows, wrap
+/// them in the padded authenticated-plaintext encoding, then AEAD-encrypt under
+/// `K_index` with `ad = [FORMAT_VERSION]` and a fresh nonce. Returns
+/// `(nonce, ct)`.
+///
+/// The padded plaintext is `true_len(u32-LE) ‖ postcard ‖ zero-pad` to an
+/// [`INDEX_BUCKET`] multiple. `true_len` lives inside the AEAD, so the tag
+/// covers it and the padding is authenticated; the on-disk
+/// `sealed_index_ct_len` is therefore a bucket-quantized size class.
 fn seal_index(
     index: &Index,
     k_master: &MasterKey,
 ) -> Result<([u8; NONCE_LEN], Vec<u8>), VaultError> {
     let key = hkdf_expand(k_master, INDEX_INFO);
-    let plaintext =
+    let postcard_bytes =
         postcard::to_stdvec(index.as_rows()).map_err(|_| VaultError::MalformedRecord {
             reason: "failed to serialize sealed index",
         })?;
+    let plaintext = pad_index_plaintext(&postcard_bytes);
     let nonce = random_nonce();
     let ad = [FORMAT_VERSION];
     let ct = aead::encrypt(&key, &nonce, &ad, &plaintext)?;
     Ok((nonce, ct))
+}
+
+/// Wrap index postcard bytes in the v2 padded authenticated-plaintext encoding:
+/// `true_len(u32-LE) ‖ postcard ‖ zero-pad` up to an [`INDEX_BUCKET`] multiple.
+///
+/// Mirrors [`crate::record::EntryRecord::encode_padded`]; a `true_len` larger
+/// than `u32::MAX` (unreachable for any realistic index) is clamped in the
+/// prefix rather than truncating the data — the postcard bytes are still copied
+/// in full and the strip-side bound is the buffer length, not the prefix.
+fn pad_index_plaintext(postcard_bytes: &[u8]) -> Vec<u8> {
+    let true_len = u32::try_from(postcard_bytes.len()).unwrap_or(u32::MAX);
+    let unpadded = 4 + postcard_bytes.len();
+    let padded = unpadded.div_ceil(INDEX_BUCKET) * INDEX_BUCKET;
+    let mut buf = vec![0u8; padded];
+    buf[0..4].copy_from_slice(&true_len.to_le_bytes());
+    buf[4..4 + postcard_bytes.len()].copy_from_slice(postcard_bytes);
+    // `buf[unpadded..padded]` stays zero (the padding).
+    buf
+}
+
+/// Strip the v2 index padding: read the `true_len(u32-LE)` prefix and return the
+/// `true_len` postcard bytes that follow, rejecting a length that overruns the
+/// (de-padded) plaintext.
+///
+/// The plaintext is already AEAD-authenticated when this runs, so an
+/// out-of-range `true_len` implies a logic/version mismatch rather than
+/// attacker input; it is surfaced as [`VaultError::MalformedRecord`], never
+/// panicked. Mirrors the bound check in [`crate::record::EntryRecord::decode`].
+fn strip_index_padding(plaintext: &[u8]) -> Result<&[u8], VaultError> {
+    if plaintext.len() < 4 {
+        return Err(VaultError::MalformedRecord {
+            reason: "sealed index missing true-length prefix",
+        });
+    }
+    let true_len = u32::from_le_bytes([plaintext[0], plaintext[1], plaintext[2], plaintext[3]]);
+    let end = 4usize
+        .checked_add(true_len as usize)
+        .ok_or(VaultError::MalformedRecord {
+            reason: "sealed index length overflows",
+        })?;
+    if end > plaintext.len() {
+        return Err(VaultError::MalformedRecord {
+            reason: "sealed index length exceeds plaintext",
+        });
+    }
+    Ok(&plaintext[4..end])
 }
 
 /// Encrypt one entry record into an [`EntryEnvelope`] under `K_entry(id)` with a

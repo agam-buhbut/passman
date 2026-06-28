@@ -12,8 +12,14 @@
 //! Reused by every shell (desktop GUI, mobile binding), so it is UI-toolkit-free
 //! and tested against the mock backend.
 
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+/// How often the unlocked loop wakes to enforce the §5.2 hard timeout when no
+/// request is driving it. Small enough that an idle session locks within ~1 s of
+/// its deadline; the wake is a single clock comparison, so the cost is trivial.
+const EXPIRY_POLL: Duration = Duration::from_secs(1);
 
 use crate::{
     App, Clipboard, ClipboardCookie, CoreError, EntryHandle, RevealField, UnlockError, UnlockedApp,
@@ -86,7 +92,10 @@ pub enum Response {
     /// The current entry list (after `Refresh` / a mutation).
     Entries { entries: Vec<EntryHandle> },
     /// A revealed field value (the UI shows it, then it is dropped/zeroized).
-    Revealed { field: RevealField, value: SecretString },
+    Revealed {
+        field: RevealField,
+        value: SecretString,
+    },
     /// A field was copied; the cookie lets the UI schedule the clear.
     Copied { cookie: ClipboardCookie },
     /// A generated password (for the add form).
@@ -145,10 +154,17 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        // Tell the worker to stop, but do NOT join it. A worker stuck in a slow
+        // or hung op (a multi-second Argon2 unlock, a wedged biometric prompt)
+        // must not block the caller — usually the UI thread at shutdown. The
+        // JoinHandle is simply dropped: the thread detaches and exits on the Quit
+        // it just received (or when its current op finishes). It owns everything
+        // it touches and vault writes are atomic (temp+rename), so nothing leaks
+        // or corrupts. ponytail: detach over a timed join — std has no timed
+        // join, and a Session's lifetime tracks the process, so there is nothing
+        // left to reclaim.
         let _ = self.tx.send(Request::Quit);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
+        drop(self.join.take());
     }
 }
 
@@ -180,7 +196,8 @@ fn run_worker<H, C>(
     loop {
         match requests.recv() {
             Ok(Request::Create { master, kdf }) => {
-                match app.create_vault(&master, kdf, TotpConfig::default(), &(), prompter.as_ref()) {
+                match app.create_vault(&master, kdf, TotpConfig::default(), &(), prompter.as_ref())
+                {
                     Ok((mut unlocked, uri)) => {
                         let entries = unlocked.list_entries().unwrap_or_default();
                         let created = Response::Created {
@@ -242,9 +259,19 @@ fn run_worker<H, C>(
                 }
             }
             Ok(Request::Quit) | Err(_) => return,
-            // Any other request while locked is ignored (the UI only sends them
-            // while it believes the session is unlocked).
-            Ok(_) => {}
+            // ClearClipboard is fire-and-forget — no caller awaits a response,
+            // so drop it silently. Sending a response here would desync the next
+            // request→response caller's recv(). (Actually wiping the clipboard
+            // after a lock is a separate, low-severity improvement.)
+            Ok(Request::ClearClipboard { .. }) => {}
+            // Every other request needs an unlocked session and arrived via a
+            // synchronous request→response caller (e.g. the UniFFI `call()`).
+            // Reply `Locked` so it receives its one response instead of blocking
+            // forever on recv() — the deadlock that froze the app once a lazy
+            // 120 s expiry (or an explicit lock) returned the worker to this loop.
+            Ok(_) => {
+                let _ = responses.send(Response::Locked);
+            }
         }
     }
 }
@@ -296,15 +323,95 @@ where
     H: HardwareKeyStore<PlatformCtx = ()>,
     C: Clipboard,
 {
+    // The cookie of the secret most recently copied to the clipboard, if it is
+    // still believed live (a later ClearClipboard that wiped it forgets it). On
+    // the lock transition we proactively wipe it: the post-lock ClearClipboard
+    // the GTK shell schedules 30 s after a copy is DROPPED by the locked outer
+    // loop (it is fire-and-forget), so if the session locks first — an explicit
+    // Lock or the §5.2 idle auto-lock below — the secret would otherwise sit on
+    // the OS clipboard indefinitely for a scraper to read (pentest S4).
+    let mut live_cookie: Option<ClipboardCookie> = None;
     loop {
-        let Ok(request) = requests.recv() else {
-            return Flow::Quit;
-        };
-        let flow = handle_unlocked(unlocked, clipboard, fact_overwrite, request, responses);
-        match flow {
-            Flow::Continue => {}
-            other => return other,
+        match requests.recv_timeout(EXPIRY_POLL) {
+            Ok(request) => {
+                let flow = handle_unlocked(
+                    unlocked,
+                    clipboard,
+                    fact_overwrite,
+                    request,
+                    responses,
+                    &mut live_cookie,
+                );
+                match flow {
+                    Flow::Continue => {}
+                    Flow::Lock => {
+                        wipe_clipboard_on_exit(
+                            unlocked,
+                            clipboard,
+                            fact_overwrite,
+                            live_cookie.as_ref(),
+                        );
+                        return Flow::Lock;
+                    }
+                    // An explicit Request::Quit while unlocked: wipe a still-live
+                    // clipboard secret before the UnlockedApp drops, exactly as the
+                    // Lock path does — otherwise the shell's pending ClearClipboard
+                    // never runs and the copied password is stranded (pentest S4).
+                    Flow::Quit => {
+                        wipe_clipboard_on_exit(
+                            unlocked,
+                            clipboard,
+                            fact_overwrite,
+                            live_cookie.as_ref(),
+                        );
+                        return Flow::Quit;
+                    }
+                }
+            }
+            // Idle tick: enforce the §5.2 hard timeout even with no request, so
+            // an unlocked session can't sit resident in memory indefinitely.
+            Err(RecvTimeoutError::Timeout) => {
+                if unlocked.is_expired() {
+                    wipe_clipboard_on_exit(
+                        unlocked,
+                        clipboard,
+                        fact_overwrite,
+                        live_cookie.as_ref(),
+                    );
+                    return Flow::Lock;
+                }
+            }
+            // The request channel closed (the Session was dropped → Quit). Wipe a
+            // still-live clipboard secret before the UnlockedApp drops, exactly as
+            // the Lock path does (pentest S4, Quit-via-disconnect variant).
+            Err(RecvTimeoutError::Disconnected) => {
+                wipe_clipboard_on_exit(unlocked, clipboard, fact_overwrite, live_cookie.as_ref());
+                return Flow::Quit;
+            }
         }
+    }
+}
+
+/// On a lock OR quit transition, proactively wipe a still-live clipboard secret
+/// while we still hold the (about-to-be-dropped) `UnlockedApp`.
+/// `clear_clipboard_with` is explicitly designed to run post-expiry, so calling
+/// it here (where the session has just expired, been locked, or is quitting) is
+/// sound. No response is sent: this is the worker's own cleanup, not a reply to
+/// any request.
+fn wipe_clipboard_on_exit<H, C>(
+    unlocked: &UnlockedApp<H>,
+    clipboard: Option<&C>,
+    fact_overwrite: bool,
+    live_cookie: Option<&ClipboardCookie>,
+) where
+    H: HardwareKeyStore<PlatformCtx = ()>,
+    C: Clipboard,
+{
+    if let (Some(cookie), Some(clip)) = (live_cookie, clipboard) {
+        // ClearOutcome is #[must_use]; the result is advisory (the cookie may be
+        // stale or the clipboard now holds a foreign value) and there is no
+        // caller to surface it to on the lock path.
+        let _ = unlocked.clear_clipboard_with(cookie, clip, fact_overwrite);
     }
 }
 
@@ -316,6 +423,7 @@ fn handle_unlocked<H, C>(
     fact_overwrite: bool,
     request: Request,
     responses: &Sender<Response>,
+    live_cookie: &mut Option<ClipboardCookie>,
 ) -> Flow
 where
     H: HardwareKeyStore<PlatformCtx = ()>,
@@ -338,7 +446,13 @@ where
         }
         Request::Copy { id, field } => match clipboard {
             Some(clip) => match unlocked.copy_to_clipboard(&id, field, clip) {
-                Ok(cookie) => send_or_lock(responses, Response::Copied { cookie }),
+                Ok(cookie) => {
+                    // Remember the live cookie so the lock transition can wipe it
+                    // if the session locks before the shell's clear timer fires.
+                    // ClipboardCookie is Copy, so this records a copy, not a move.
+                    *live_cookie = Some(cookie);
+                    send_or_lock(responses, Response::Copied { cookie });
+                }
                 Err(e) => return on_op_error(&e, responses),
             },
             None => send_or_lock(
@@ -352,9 +466,17 @@ where
             if let Some(clip) = clipboard {
                 let _ = unlocked.clear_clipboard_with(&cookie, clip, fact_overwrite);
             }
+            // The shell's clear timer fired in time: forget the cookie so we don't
+            // redundantly re-wipe on a later lock (and a foreign clipboard value
+            // is left untouched).
+            *live_cookie = None;
         }
         Request::Generate { length } => {
-            let req = GenerationRequest::new(length, Charset::default_vault(), RequiredClasses::one_of_each());
+            let req = GenerationRequest::new(
+                length,
+                Charset::default_vault(),
+                RequiredClasses::one_of_each(),
+            );
             match unlocked.generate_password(&req) {
                 Ok(password) => send_or_lock(responses, Response::Generated { password }),
                 Err(e) => return on_op_error(&e, responses),
@@ -423,7 +545,10 @@ fn unlock_message(e: &UnlockError) -> String {
     match e {
         UnlockError::BadCredentials => "Incorrect master password or TOTP code.".to_owned(),
         UnlockError::LockedOut { remaining } => {
-            format!("Locked out; try again in about {} s.", remaining.as_secs().max(1))
+            format!(
+                "Locked out; try again in about {} s.",
+                remaining.as_secs().max(1)
+            )
         }
         UnlockError::Cancelled => "Unlock cancelled.".to_owned(),
         UnlockError::Retryable => "Transient hardware error; please retry.".to_owned(),

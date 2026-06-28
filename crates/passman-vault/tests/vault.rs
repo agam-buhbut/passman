@@ -14,7 +14,7 @@ use passman_crypto::{KdfParams, MasterKey, SecretArray, SecretString};
 use passman_policy::EntryPolicy;
 use passman_vault::{
     EntryId, EntryRecord, IndexEntry, Vault, VaultError, VaultMetadata, FORMAT_VERSION,
-    KDF_ALGORITHM_ARGON2ID,
+    KDF_ALGORITHM_ARGON2ID, PROBE_PLAINTEXT,
 };
 
 // ---------------------------------------------------------------------------
@@ -453,6 +453,110 @@ fn padding_stripped_record_equals_original() {
 }
 
 // ---------------------------------------------------------------------------
+// Sealed-index padding (threat #18 / §4.5: the sealed-index ciphertext length
+// must not leak the sum of label+policy byte lengths).
+// ---------------------------------------------------------------------------
+
+/// Build a vault holding two entries with the supplied labels (fixed ids so the
+/// only difference between two such vaults is the label byte lengths).
+fn vault_with_labels(label_a: &str, label_b: &str) -> Vault {
+    let km = k_master();
+    let mut v = empty_vault();
+    let id_a = EntryId::from_bytes([0x11u8; 16]);
+    let id_b = EntryId::from_bytes([0x22u8; 16]);
+    v.add_or_update_entry(
+        &km,
+        id_a,
+        label_a.to_owned(),
+        EntryPolicy::default(),
+        &record("u", "p", "", ""),
+    )
+    .expect("add a");
+    v.add_or_update_entry(
+        &km,
+        id_b,
+        label_b.to_owned(),
+        EntryPolicy::default(),
+        &record("u", "p", "", ""),
+    )
+    .expect("add b");
+    v
+}
+
+#[test]
+fn sealed_index_ct_len_does_not_leak_label_lengths() {
+    // Same entry count, vastly different total label byte length. The sealed
+    // index must be padded to a bucket, so both serialize to the SAME
+    // sealed-index ciphertext length (this is the property the fix delivers; it
+    // FAILS before the padding change).
+    let short = vault_with_labels("a", "b");
+    let long = vault_with_labels(
+        "a-very-long-descriptive-label-xxxxxxxx",
+        "another-long-one-yyyyyyyyyy",
+    );
+
+    let short_len = sealed_index_ct_len(&short);
+    let long_len = sealed_index_ct_len(&long);
+    assert_eq!(
+        short_len, long_len,
+        "padded sealed-index ciphertext length must not reveal label-length \
+         differences (short={short_len}, long={long_len})"
+    );
+}
+
+#[test]
+fn sealed_index_padded_format_round_trips() {
+    // The new padded index must survive create -> to_bytes -> from_bytes ->
+    // open_index, list entries, and reveal a field.
+    let km = k_master();
+    let (v, ids) = vault_with_entries(3);
+
+    let parsed = Vault::from_bytes(&v.to_bytes()).expect("parse");
+    let idx = parsed.open_index(&km).expect("open padded index");
+    assert_eq!(idx.len(), 3);
+    for (i, id) in ids.iter().enumerate() {
+        assert_eq!(idx.get(id).expect("row").label, format!("label {i}"));
+    }
+    // Reveal a field through the round-tripped vault.
+    let rec0 = parsed.decrypt_entry(&km, &ids[0]).expect("decrypt");
+    assert_eq!(rec0.username.expose(), "user0");
+}
+
+#[test]
+fn old_unpadded_index_still_loads() {
+    // Back-compat: a vault serialized in the OLD (v1, unpadded index) format
+    // must still load and list correctly. We synthesize a genuine old-format
+    // byte stream from a fresh vault: rewrite the version byte to v1 everywhere
+    // it is AD-bound (header + probe + index AD) and re-seal the index in the
+    // old unpadded form. The header version then drives the decrypt branch.
+    let km = k_master();
+    let (v, ids) = vault_with_entries(2);
+    let old_bytes = downgrade_to_v1(&v);
+
+    let parsed = Vault::from_bytes(&old_bytes).expect("v1 vault parses");
+    assert_eq!(parsed.format_version(), 0x01);
+    parsed.verify_probe(&km).expect("v1 probe verifies");
+    let idx = parsed.open_index(&km).expect("v1 index opens");
+    assert_eq!(idx.len(), 2);
+    for (i, id) in ids.iter().enumerate() {
+        assert_eq!(idx.get(id).expect("row").label, format!("label {i}"));
+    }
+}
+
+#[test]
+fn padded_index_with_oversized_true_len_is_rejected() {
+    // A v2 padded index whose true_len prefix claims more bytes than the
+    // (de-padded) plaintext holds must be rejected (no panic, Err). The padded
+    // plaintext is INSIDE the AEAD, so we seal a malformed plaintext directly
+    // with the crate's K_index and v2 AD, then assert open fails.
+    let km = k_master();
+    let v = empty_vault();
+    let bytes = reseal_index_raw_plaintext(&v, &oversized_true_len_plaintext());
+    let parsed = Vault::from_bytes(&bytes).expect("parses structurally");
+    assert!(parsed.open_index(&km).is_err());
+}
+
+// ---------------------------------------------------------------------------
 // Parser robustness — malformed inputs must Err, never panic
 // ---------------------------------------------------------------------------
 
@@ -480,12 +584,15 @@ fn truncated_at_each_major_field_boundary_errors() {
 
 #[test]
 fn wrong_version_byte_errors() {
+    // 0x01 (legacy) and 0x02 (current) are both accepted; an unknown version
+    // (0x03) must still be rejected. (Updated from asserting on 0x02 when the
+    // index-padding change bumped the current version 0x01 -> 0x02.)
     let v = empty_vault();
     let mut bytes = v.to_bytes();
-    bytes[0] = 0x02;
+    bytes[0] = 0x03;
     assert!(matches!(
         Vault::from_bytes(&bytes),
-        Err(VaultError::UnsupportedVersion { got: 0x02, .. })
+        Err(VaultError::UnsupportedVersion { got: 0x03, .. })
     ));
 }
 
@@ -702,14 +809,49 @@ fn drop_last_envelope(v: &Vault) -> Vec<u8> {
 /// public mutation path always keeps the id sets equal, so to *provoke* a
 /// mismatch we encrypt arbitrary rows directly with the same `K_index` the
 /// crate would derive.
+///
+/// The rows are wrapped in the v2 padded index encoding (`true_len` prefix +
+/// zero-pad to a 256-byte bucket) so this fixture faithfully mirrors the
+/// crate's own sealing; the provoked failure is then the intended
+/// index↔envelope mismatch, not a padding-decode error.
 fn reseal_index_rows(v: &Vault, rows: &[IndexEntry]) -> Vec<u8> {
+    let postcard_bytes = postcard::to_stdvec(&rows.to_vec()).expect("serialize rows");
+    reseal_index_raw_plaintext(v, &pad_index_plaintext(&postcard_bytes))
+}
+
+/// Pad an index postcard blob into the v2 authenticated-plaintext form:
+/// `true_len(u32-LE) ‖ postcard_bytes ‖ zero-pad` up to a 256-byte multiple.
+/// Mirrors the crate-internal `seal_index` padding so test fixtures stay in
+/// lock-step with the real format.
+fn pad_index_plaintext(postcard_bytes: &[u8]) -> Vec<u8> {
+    const BUCKET: usize = 256;
+    let unpadded = 4 + postcard_bytes.len();
+    let padded = unpadded.div_ceil(BUCKET) * BUCKET;
+    let mut buf = vec![0u8; padded];
+    let true_len = u32::try_from(postcard_bytes.len()).expect("index fits u32");
+    buf[0..4].copy_from_slice(&true_len.to_le_bytes());
+    buf[4..4 + postcard_bytes.len()].copy_from_slice(postcard_bytes);
+    buf
+}
+
+/// A malformed v2 padded-index plaintext whose `true_len` prefix exceeds the
+/// buffer (claims 1000 bytes inside a single 256-byte bucket).
+fn oversized_true_len_plaintext() -> Vec<u8> {
+    let mut buf = vec![0u8; 256];
+    buf[0..4].copy_from_slice(&1000u32.to_le_bytes());
+    buf
+}
+
+/// Seal `plaintext` directly under the crate's `K_index` with the v2 AD and
+/// splice it into `v`'s byte stream as the sealed index (envelopes unchanged).
+/// `plaintext` is the *already-padded* authenticated plaintext.
+fn reseal_index_raw_plaintext(v: &Vault, plaintext: &[u8]) -> Vec<u8> {
     use passman_crypto::{aead, hkdf_expand, random_nonce};
 
     let key = hkdf_expand(&k_master(), passman_vault::INDEX_INFO);
-    let plaintext = postcard::to_stdvec(&rows.to_vec()).expect("serialize rows");
     let nonce = random_nonce();
     let ad = [FORMAT_VERSION];
-    let ct = aead::encrypt(&key, &nonce, &ad, &plaintext).expect("seal");
+    let ct = aead::encrypt(&key, &nonce, &ad, plaintext).expect("seal");
 
     // Rebuild the byte stream from `sealed_index_nonce` onward.
     let mut bytes = v.to_bytes();
@@ -729,4 +871,119 @@ fn reseal_index_rows(v: &Vault, rows: &[IndexEntry]) -> Vec<u8> {
         bytes.extend_from_slice(&env.ciphertext_and_tag);
     }
     bytes
+}
+
+/// Synthesize a genuine OLD (v1) on-disk vault from a current (v2) vault.
+///
+/// The version byte is AD-bound in three places: the header probe AD, the
+/// per-entry envelope AD, and the sealed-index AD. To produce a vault that the
+/// v1 decrypt path accepts, we re-derive every one of those from a fresh v1
+/// vault: build a brand-new vault whose header version is 0x01, re-seal its
+/// index UNPADDED with `ad=[0x01]`, and re-encrypt each entry envelope with
+/// `ad = 0x01 ‖ id`. We reuse `v`'s ids/labels/records so the loaded vault is
+/// equivalent. This is exactly what the previous (pre-padding) code would have
+/// written.
+fn downgrade_to_v1(v: &Vault) -> Vec<u8> {
+    use passman_crypto::{aead, hkdf_expand, random_nonce};
+
+    let km = k_master();
+
+    // Decrypt the current index + records so we can re-seal them under v1 AD.
+    let idx = v.open_index(&km).expect("open current index");
+
+    // 1. Re-seal the index UNPADDED with ad=[0x01] (the old format).
+    let postcard_bytes = postcard::to_stdvec(&idx.entries().to_vec()).expect("serialize index");
+    let index_key = hkdf_expand(&km, passman_vault::INDEX_INFO);
+    let index_nonce = random_nonce();
+    let index_ct =
+        aead::encrypt(&index_key, &index_nonce, &[0x01u8], &postcard_bytes).expect("seal v1 index");
+
+    // 2. Re-seal the probe under v1 AD. The probe AD binds the version, so a
+    //    probe sealed under v2 will not verify once the header reads v1.
+    let probe_nonce = random_nonce();
+    let mut probe_ad = Vec::new();
+    probe_ad.push(0x01u8); // format_version
+    probe_ad.push(KDF_ALGORITHM_ARGON2ID); // kdf_algorithm_id
+    probe_ad.extend_from_slice(&v.kdf_params().to_bytes());
+    probe_ad.extend_from_slice(v.vault_salt());
+    probe_ad.extend_from_slice(b"probe-v0");
+    let probe_ct =
+        aead::encrypt(&km, &probe_nonce, &probe_ad, PROBE_PLAINTEXT).expect("seal v1 probe");
+    assert_eq!(
+        probe_ct.len(),
+        32,
+        "probe ct is 16-byte payload + 16-byte tag"
+    );
+
+    // 3. Start from the v2 bytes, rewrite the header version byte to 0x01, and
+    //    splice in the v1 probe (nonce at offset 43, ct at offset 67).
+    let mut bytes = v.to_bytes();
+    bytes[0] = 0x01;
+    bytes[43..67].copy_from_slice(&probe_nonce);
+    bytes[67..99].copy_from_slice(&probe_ct);
+
+    // 4. Splice in the v1 sealed index in place of the v2 one.
+    let nonce_off = sealed_index_nonce_offset(v);
+    bytes.truncate(nonce_off);
+    bytes.extend_from_slice(&index_nonce);
+    let index_ct_len = u32::try_from(index_ct.len()).expect("ct len fits u32");
+    bytes.extend_from_slice(&index_ct_len.to_le_bytes());
+    bytes.extend_from_slice(&index_ct);
+
+    // 5. Re-encrypt every envelope with ad = 0x01 ‖ id (the old per-entry AD),
+    //    reusing each entry's plaintext record so the contents are preserved.
+    let count = u32::try_from(v.envelopes().len()).expect("count fits u32");
+    bytes.extend_from_slice(&count.to_le_bytes());
+    for env in v.envelopes() {
+        let id = env.id;
+        let rec = v.decrypt_entry(&km, &id).expect("decrypt for re-encrypt");
+        let info = entry_info_bytes(&id);
+        let entry_key = passman_crypto::EntryKey::new(hkdf_expand(&km, &info));
+        let padded = encode_record_padded(&rec);
+        let nonce = random_nonce();
+        let mut ad = [0u8; 17];
+        ad[0] = 0x01;
+        ad[1..].copy_from_slice(id.as_bytes());
+        let ct = aead::encrypt(&entry_key, &nonce, &ad, &padded).expect("encrypt entry v1");
+        let ct_len = u32::try_from(ct.len()).expect("ct len fits u32");
+        bytes.extend_from_slice(id.as_bytes());
+        bytes.extend_from_slice(&nonce);
+        bytes.extend_from_slice(&ct_len.to_le_bytes());
+        bytes.extend_from_slice(&ct);
+    }
+    bytes
+}
+
+/// Reproduce `entry-v0:` ‖ id HKDF info (the crate-internal `entry_info`).
+fn entry_info_bytes(id: &EntryId) -> Vec<u8> {
+    let mut info = Vec::with_capacity(9 + 16);
+    info.extend_from_slice(passman_vault::ENTRY_INFO_PREFIX);
+    info.extend_from_slice(id.as_bytes());
+    info
+}
+
+/// Reproduce the per-entry bucket padding (`true_len ‖ four length-prefixed
+/// fields ‖ zero-pad`) for the v1 re-encrypt path. The entry padding format is
+/// unchanged between v1 and v2; only the index gained padding.
+fn encode_record_padded(rec: &EntryRecord) -> Vec<u8> {
+    const BUCKET: usize = 256;
+    let fields: [&[u8]; 4] = [
+        rec.username.expose().as_bytes(),
+        rec.password.expose().as_bytes(),
+        rec.url.expose().as_bytes(),
+        rec.notes.expose().as_bytes(),
+    ];
+    let record_len: usize = fields.iter().map(|f| 4 + f.len()).sum();
+    let unpadded = 4 + record_len;
+    let padded = unpadded.div_ceil(BUCKET) * BUCKET;
+    let mut buf = vec![0u8; padded];
+    buf[0..4].copy_from_slice(&u32::try_from(record_len).expect("fits").to_le_bytes());
+    let mut off = 4;
+    for f in fields {
+        buf[off..off + 4].copy_from_slice(&u32::try_from(f.len()).expect("fits").to_le_bytes());
+        off += 4;
+        buf[off..off + f.len()].copy_from_slice(f);
+        off += f.len();
+    }
+    buf
 }

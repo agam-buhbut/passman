@@ -28,6 +28,8 @@ anyhow = { workspace = true }
 arboard = { workspace = true }
 sha2 = { workspace = true }
 zeroize = { workspace = true }
+# Core-dump suppression at process startup (pentest S6); only called from main.rs.
+libc = { workspace = true }
 
 [dev-dependencies]
 # The session-actor logic is GTK-free and tested against the mock backend.

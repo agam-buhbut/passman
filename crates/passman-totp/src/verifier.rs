@@ -29,6 +29,14 @@ pub fn current_step(ts: Timestamp, period: u64) -> u64 {
 #[derive(Debug, Clone)]
 pub struct TotpVerifier {
     config: TotpConfig,
+    // LIMITATION (accepted): this cache is per-process and is NOT persisted to
+    // disk.  A process restart resets it, which means the same TOTP step code
+    // could be accepted again within the ±skew window (up to ±1 step / 30-90 s)
+    // after a restart.  Persisting the last-accepted step across restarts would
+    // require writing authentication state to disk (a new attack surface and a
+    // complexity cost that outweighs the narrow window of exposure).  The ±1
+    // step / 30-90 s bound is the accepted residual risk; §11 row 10 documents
+    // this trade-off.
     last_accepted_step: Option<u64>,
 }
 

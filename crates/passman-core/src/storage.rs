@@ -170,6 +170,12 @@ pub struct InstanceLock {
     /// The locked handle. Kept alive for the lock's duration; `unlock` is
     /// called explicitly on drop and the OS unlocks on close as a backstop.
     file: File,
+    /// Whether we actually hold an OS advisory lock. `false` when this
+    /// platform's `std` has no file locking (e.g. Android, where
+    /// [`std::fs::File::try_lock`] is unconditionally `Unsupported`); there we
+    /// proceed without a lock rather than refusing to open. Drop only releases
+    /// when this is `true`.
+    locked: bool,
 }
 
 impl InstanceLock {
@@ -199,13 +205,32 @@ impl InstanceLock {
             .map_err(|e| CoreError::io("open instance lockfile", e))?;
 
         // `try_lock` takes an *exclusive* advisory lock without blocking.
-        // `WouldBlock` means another instance holds it; any other error is a
-        // genuine I/O failure.
-        match file.try_lock() {
-            Ok(()) => Ok(Self { file }),
-            Err(TryLockError::WouldBlock) => Err(CoreError::AlreadyRunning),
-            Err(TryLockError::Error(e)) => Err(CoreError::io("lock instance lockfile", e)),
-        }
+        // `classify_lock` interprets the outcome (including the Android case
+        // where `std` reports the operation unsupported).
+        let locked = classify_lock(file.try_lock())?;
+        Ok(Self { file, locked })
+    }
+}
+
+/// Interpret a [`std::fs::File::try_lock`] outcome for [`InstanceLock`].
+///
+/// Returns `Ok(true)` when the advisory lock was taken, `Ok(false)` when the
+/// platform does not support file locking at all (so the caller proceeds
+/// without one), and an error when another instance holds the lock or a genuine
+/// I/O failure occurred.
+fn classify_lock(result: Result<(), TryLockError>) -> Result<bool, CoreError> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(TryLockError::WouldBlock) => Err(CoreError::AlreadyRunning),
+        // ponytail: this platform's `std` has no advisory file locking —
+        // Android's `File::try_lock` is hard-coded to `Unsupported` (the
+        // `cfg` list for the `flock` impl omits `target_os = "android"`). The
+        // lock is only advisory (D27) and Android already runs a single app
+        // process, so proceed without one instead of failing `App::open` (which
+        // crashes the app on launch). Upgrade path: an `fcntl(F_SETLK)` shim if
+        // a multi-process platform without `flock` ever needs real locking.
+        Err(TryLockError::Error(e)) if e.kind() == std::io::ErrorKind::Unsupported => Ok(false),
+        Err(TryLockError::Error(e)) => Err(CoreError::io("lock instance lockfile", e)),
     }
 }
 
@@ -214,7 +239,10 @@ impl Drop for InstanceLock {
         // Explicitly release; closing the file would also release it, but doing
         // it eagerly keeps the window tight. A failure here is unrecoverable at
         // drop time and harmless (the OS releases on close), so it is ignored.
-        let _ = self.file.unlock();
+        // Skip when we never held a lock (the platform had no locking support).
+        if self.locked {
+            let _ = self.file.unlock();
+        }
     }
 }
 
@@ -233,10 +261,40 @@ fn lock_path_for(vault_path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{atomic_write, lock_path_for, read, temp_sibling, InstanceLock};
+    use super::{atomic_write, classify_lock, lock_path_for, read, temp_sibling, InstanceLock};
     use crate::error::CoreError;
+    use std::fs::TryLockError;
+    use std::io;
     use std::path::Path;
     use tempfile::tempdir;
+
+    #[test]
+    fn classify_lock_maps_each_try_lock_outcome() {
+        // Lock acquired.
+        assert!(matches!(classify_lock(Ok(())), Ok(true)));
+        // Held by another instance.
+        assert!(matches!(
+            classify_lock(Err(TryLockError::WouldBlock)),
+            Err(CoreError::AlreadyRunning)
+        ));
+        // Android: `std`'s `File::try_lock` is unconditionally `Unsupported`.
+        // The advisory lock must degrade to "proceed without one" (Ok(false)),
+        // NOT propagate an error — otherwise `App::open` fails and the app
+        // crashes on launch.
+        assert!(matches!(
+            classify_lock(Err(TryLockError::Error(io::Error::from(
+                io::ErrorKind::Unsupported
+            )))),
+            Ok(false)
+        ));
+        // A genuine I/O failure still surfaces as an error.
+        assert!(matches!(
+            classify_lock(Err(TryLockError::Error(io::Error::from(
+                io::ErrorKind::PermissionDenied
+            )))),
+            Err(CoreError::Io { .. })
+        ));
+    }
 
     #[test]
     fn atomic_write_then_read_round_trips() {

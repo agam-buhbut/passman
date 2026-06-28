@@ -16,7 +16,10 @@ use passman_vault::EntryRecord;
     about = "Local-only, hardware-backed password manager.\n\nYour vault is protected by your master password AND a key held in your device's \
              hardware (a TPM), with a one-time TOTP code required at unlock. \
              Nothing is sent over the network.",
-    long_about = None
+    long_about = None,
+    // Running `passman` with no command prints the help instead of a terse
+    // "a subcommand is required" error — friendlier for a first run.
+    arg_required_else_help = true
 )]
 pub struct Cli {
     /// Fall back to the OS keyring when this device has no usable TPM.
@@ -89,7 +92,7 @@ pub enum Command {
         /// Output file path.
         file: PathBuf,
         /// Backup strength (higher = slower to open, harder to crack).
-        #[arg(long, value_enum, default_value_t = RecPreset::Floor)]
+        #[arg(long, value_enum, default_value_t = RecPreset::Default)]
         preset: RecPreset,
     },
 
@@ -195,4 +198,24 @@ pub fn entry_record(
     notes: passman_crypto::SecretString,
 ) -> EntryRecord {
     EntryRecord::new(username, password, url, notes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command, RecPreset};
+    use clap::Parser;
+
+    #[test]
+    fn export_defaults_to_the_strong_preset_not_the_floor() {
+        // The recovery export's password-only KDF is the dominant residual risk
+        // (architecture.md §3.4 / §11 #19), which the threat model sizes at the
+        // 4 GiB/8 Default preset — the §8.4 weak-export argument depends on it.
+        // A plain `passman export <file>` must therefore NOT fall back to the
+        // 1 GiB/4 Floor.
+        let cli = Cli::try_parse_from(["passman", "export", "backup.pmr"]).expect("parse");
+        match cli.command {
+            Command::Export { preset, .. } => assert_eq!(preset, RecPreset::Default),
+            other => panic!("expected Export, got {other:?}"),
+        }
+    }
 }

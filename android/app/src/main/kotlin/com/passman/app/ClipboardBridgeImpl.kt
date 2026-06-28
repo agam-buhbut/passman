@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
+import android.os.Build
 import android.os.PersistableBundle
 import java.security.MessageDigest
 import uniffi.passman_uniffi.CallbackException
@@ -21,8 +22,12 @@ class ClipboardBridgeImpl(private val context: Context) : ClipboardBridge {
 
     override fun write(secret: String): ByteArray {
         val clip = ClipData.newPlainText("passman", secret).apply {
-            description.extras = PersistableBundle().apply {
-                putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true)
+            // EXTRA_IS_SENSITIVE excludes the clip from clipboard previews/history.
+            // The key is only honored on Android 13+ (API 33); guard accordingly.
+            if (Build.VERSION.SDK_INT >= 33) {
+                description.extras = PersistableBundle().apply {
+                    putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true)
+                }
             }
         }
         (manager ?: throw CallbackException.Failed()).setPrimaryClip(clip)

@@ -216,6 +216,25 @@ impl HardwareKeyStore for SecretServiceKeyStore {
 ///   error, so no blob, key, or PIN can leak (per the `HsmError` contract).
 fn map_keyring_error(err: &KeyringError) -> HsmError {
     match err {
+        // SECURITY: `NoEntry` maps to `PermanentlyInvalidated`, which §4.3
+        // routes to "recover from backup" — a serious prompt but NOT an
+        // automatic destructive action; the user must confirm before any wipe.
+        //
+        // Residual risk: if the Secret Service backend ever returns `NoEntry`
+        // for a *locked* collection (rather than a genuinely-absent entry),
+        // the user would be wrongly shown a recovery prompt.  In practice
+        // this is very unlikely with keyring v3: a locked collection produces
+        // `Error::Locked` at the D-Bus layer, which `keyring` translates to
+        // `NoStorageAccess` (see `secret_service.rs` → `no_access()`), not
+        // `NoEntry`.  The `NoStorageAccess → Transient` arm below therefore
+        // handles the locked-keyring case correctly.
+        //
+        // If a future keyring version or alternative D-Bus backend changes
+        // this routing, the symptom is a false "permanently invalidated"
+        // prompt (recoverable by dismissing and unlocking the keyring) — not
+        // silent data loss.  No code guard is added because the keyring v3
+        // API does not expose a cheap per-entry "collection is locked" check
+        // that would be safe to call here without additional D-Bus round-trips.
         KeyringError::NoEntry => HsmError::PermanentlyInvalidated,
         KeyringError::NoStorageAccess(_) => HsmError::Transient,
         KeyringError::PlatformFailure(_) => {
@@ -429,5 +448,66 @@ mod tests {
         assert!(caps.max_attempts_before_lockout.is_none());
         assert!(!caps.supports_distinct_slot_pin);
         assert_eq!(store.kind(), HsmKind::SecretService);
+    }
+
+    // ---- map_keyring_error routing (pure, no D-Bus) --------------------------
+
+    #[test]
+    fn map_keyring_error_no_entry_routes_to_permanently_invalidated() {
+        // NoEntry → PermanentlyInvalidated (§4.3 recovery route).
+        // See the SECURITY comment on this arm: keyring v3 maps a locked
+        // collection to NoStorageAccess (via Error::Locked), so the residual
+        // risk of a locked-but-absent misroute is very low in practice.
+        let err = keyring::Error::NoEntry;
+        let mapped = super::map_keyring_error(&err);
+        assert!(
+            matches!(mapped, HsmError::PermanentlyInvalidated),
+            "NoEntry must map to PermanentlyInvalidated, got {mapped:?}"
+        );
+    }
+
+    #[test]
+    fn map_keyring_error_no_storage_access_routes_to_transient() {
+        // NoStorageAccess → Transient (keyring locked / D-Bus temporarily down).
+        let inner: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(std::io::Error::other("locked"));
+        let err = keyring::Error::NoStorageAccess(inner);
+        let mapped = super::map_keyring_error(&err);
+        assert!(
+            matches!(mapped, HsmError::Transient),
+            "NoStorageAccess must map to Transient, got {mapped:?}"
+        );
+    }
+
+    #[test]
+    fn map_keyring_error_platform_failure_routes_to_backend() {
+        let inner: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(std::io::Error::other("platform"));
+        let err = keyring::Error::PlatformFailure(inner);
+        let mapped = super::map_keyring_error(&err);
+        assert!(
+            matches!(mapped, HsmError::Backend(_)),
+            "PlatformFailure must map to Backend, got {mapped:?}"
+        );
+    }
+
+    #[test]
+    fn map_keyring_error_bad_encoding_routes_to_backend() {
+        let err = keyring::Error::BadEncoding(vec![0xff, 0xfe]);
+        let mapped = super::map_keyring_error(&err);
+        assert!(
+            matches!(mapped, HsmError::Backend(_)),
+            "BadEncoding must map to Backend, got {mapped:?}"
+        );
+    }
+
+    #[test]
+    fn map_keyring_error_too_long_routes_to_backend() {
+        let err = keyring::Error::TooLong("attr".to_owned(), 256);
+        let mapped = super::map_keyring_error(&err);
+        assert!(
+            matches!(mapped, HsmError::Backend(_)),
+            "TooLong must map to Backend, got {mapped:?}"
+        );
     }
 }

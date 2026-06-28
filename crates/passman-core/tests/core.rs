@@ -1027,13 +1027,10 @@ fn progress_brackets_each_argon2_operation() {
     let path = dir.path().join("vault.pmv");
     let counts = Arc::new(ProgressCounts::default());
 
-    let app = App::open_allowing_software_hsm(
-        path,
-        MockKeyStore::new(),
-        clock.clone() as Arc<dyn Clock>,
-    )
-    .expect("open")
-    .with_progress(Arc::new(CountingProgress(counts.clone())));
+    let app =
+        App::open_allowing_software_hsm(path, MockKeyStore::new(), clock.clone() as Arc<dyn Clock>)
+            .expect("open")
+            .with_progress(Arc::new(CountingProgress(counts.clone())));
     let prompter = MockPrompter::authenticating();
 
     // create_vault runs one Argon2id derivation → one balanced start/end.
@@ -1056,14 +1053,14 @@ fn progress_brackets_each_argon2_operation() {
     let unlocked = app
         .unlock(&pw("Str0ng-Master-P@ssphrase!"), &code, &(), &prompter)
         .expect("unlock");
-    assert_eq!(counts.starts.load(Ordering::SeqCst), 2, "unlock: second start");
+    assert_eq!(
+        counts.starts.load(Ordering::SeqCst),
+        2,
+        "unlock: second start"
+    );
     assert_eq!(counts.ends.load(Ordering::SeqCst), 2, "unlock: second end");
     assert_eq!(
-        counts
-            .last_label
-            .lock()
-            .expect("label lock")
-            .as_deref(),
+        counts.last_label.lock().expect("label lock").as_deref(),
         Some("Deriving vault key"),
     );
     unlocked.lock();

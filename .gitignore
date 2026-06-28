@@ -48,3 +48,10 @@ android/app/build/
 android/app/src/main/jniLibs/
 android/app/src/main/kotlin/uniffi/
 android/.kotlin/
+
+# cargo-fuzz build artifacts (the fuzz harness Cargo.toml + fuzz_targets/ stay tracked)
+crates/*/fuzz/target/
+crates/*/fuzz/corpus/
+crates/*/fuzz/artifacts/
+crates/*/fuzz/coverage/
+crates/*/fuzz/Cargo.lock
