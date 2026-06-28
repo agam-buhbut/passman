@@ -437,12 +437,16 @@ fn advisory_lockout_after_three_failures_then_clears() {
     assert!(matches!(err, UnlockError::BadCredentials));
 }
 
-/// The advisory counter is persisted lazily: pre-threshold failures are
-/// coalesced in memory (no full-vault rewrite per attempt), and the on-disk
-/// counter is only flushed once a failure actually imposes a lockout window —
-/// but the lockout still escalates correctly across attempts in one process.
+/// Regression (L1): the advisory counter is persisted on *every* failure — not
+/// throttled until the lockout threshold is crossed. The software (Secret
+/// Service) backend has no hardware DA lockout, so the advisory timer is the
+/// only passman-side throttle; if sub-threshold failures were coalesced in
+/// memory and never flushed, a restart-per-attempt attacker would never
+/// accumulate the 3 on-disk failures and the 10-minute window would never
+/// engage across process restarts. Assert a single failure is flushed and the
+/// lockout still engages at the threshold.
 #[test]
-fn advisory_counter_persists_lazily_but_still_drives_lockout() {
+fn advisory_counter_persists_every_failure_and_drives_lockout() {
     let dir = tempfile::tempdir().expect("tempdir");
     let clock = TestClock::at(5_000_000);
     let app = open_app(dir.path(), clock.clone());
@@ -469,8 +473,21 @@ fn advisory_counter_persists_lazily_but_still_drives_lockout() {
             .rl_counter()
     };
 
-    // Two sub-threshold failures (counter 1, 2 < 3): coalesced in memory, the
-    // on-disk counter is NOT bumped (no per-attempt full-vault fsync).
+    // A single sub-threshold failure (counter 1 < 3) IS persisted immediately —
+    // this is what lets cross-process / restart-per-attempt accumulation work
+    // for the software backend, which has no hardware DA lockout to fall back on.
+    let code = valid_code(&seed, clock.now_secs());
+    let err = app
+        .unlock(&pw("nope"), &code, &(), &prompter)
+        .expect_err("fail");
+    assert!(matches!(err, UnlockError::BadCredentials));
+    assert_eq!(
+        disk_counter(),
+        1,
+        "every failed attempt must be persisted to disk"
+    );
+
+    // Two more failures cross into the lockout window; also persisted.
     for _ in 0..2 {
         let code = valid_code(&seed, clock.now_secs());
         let err = app
@@ -478,18 +495,6 @@ fn advisory_counter_persists_lazily_but_still_drives_lockout() {
             .expect_err("fail");
         assert!(matches!(err, UnlockError::BadCredentials));
     }
-    assert_eq!(
-        disk_counter(),
-        0,
-        "sub-threshold failures must be coalesced, not persisted"
-    );
-
-    // The third failure crosses into a lockout window and IS persisted.
-    let code = valid_code(&seed, clock.now_secs());
-    let err = app
-        .unlock(&pw("nope"), &code, &(), &prompter)
-        .expect_err("fail");
-    assert!(matches!(err, UnlockError::BadCredentials));
     assert!(
         disk_counter() >= 3,
         "the threshold-crossing failure must be persisted (got {})",

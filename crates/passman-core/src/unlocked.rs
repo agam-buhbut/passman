@@ -608,7 +608,18 @@ impl<'a, H: passman_hsm::HardwareKeyStore> UnlockedApp<'a, H> {
 /// [`KdfParams`] is passed and does not affect the score.
 #[must_use]
 pub fn estimate_password_strength(password: &SecretString) -> u8 {
-    match estimate_master(password.expose(), &[], &KdfParams::MEDIUM).tier {
+    // Cap the SCORING input: the GTK/Android live meters call this per keystroke,
+    // and zxcvbn over a multi-kilobyte paste can be slow on device. Any password
+    // longer than this is already maximally strong, so truncating the scored
+    // prefix cannot change the tier for any realistic password. Slice on a char
+    // boundary (no allocation, no extra heap copy of the secret).
+    const MAX_SCORED_CHARS: usize = 128;
+    let exposed = password.expose();
+    let end = exposed
+        .char_indices()
+        .nth(MAX_SCORED_CHARS)
+        .map_or(exposed.len(), |(idx, _)| idx);
+    match estimate_master(&exposed[..end], &[], &KdfParams::MEDIUM).tier {
         StrengthTier::Dangerous => 0,
         StrengthTier::Weak => 1,
         StrengthTier::Acceptable => 2,

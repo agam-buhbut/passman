@@ -278,10 +278,10 @@ impl<H: HardwareKeyStore> App<H> {
         }
 
         let now = self.clock.now();
-        // Merge the durable on-disk advisory counter with the in-process
-        // coalesced state (conservatively — the longer lockout wins) so a stream
-        // of failures escalates correctly even when sub-threshold failures were
-        // not flushed to disk (see `record_failure` / `merge_lockout`).
+        // Merge the durable on-disk advisory counter with the in-process cache
+        // (conservatively — the longer lockout wins). `record_failure` persists
+        // every failure, so disk and cache agree and this merge is normally a
+        // no-op; it is retained as a fail-safe backstop (see `merge_lockout`).
         let disk_state = LockoutState::new(vault.rl_counter(), vault.rl_last_failure());
         let mut state = self.merge_lockout(disk_state);
 
@@ -363,9 +363,9 @@ impl<H: HardwareKeyStore> App<H> {
         let totp_seed = seed;
 
         // Step 8: success — reset the advisory counter (persist) and build the
-        // session. Always clear the in-process coalesced state, even when the
-        // on-disk header is already clean (sub-threshold failures may have been
-        // coalesced in memory without ever touching disk).
+        // session. Always clear the in-process cache, even when the on-disk
+        // header is already clean, so a successful unlock never leaves a stale
+        // count behind.
         *self
             .lockout_mem
             .lock()
@@ -544,18 +544,19 @@ impl<H: HardwareKeyStore> App<H> {
     }
 
     /// Record one advisory failure (`architecture.md` §4.9): bump the state,
-    /// adopt it in the in-process coalesced cache, and persist to the vault
-    /// header **only once the failure actually imposes a lockout window**.
+    /// adopt it in the in-process cache, and persist it to the vault header on
+    /// **every** failure.
     ///
-    /// Throttle: pre-threshold failures (`lockout_minutes == 0`) impose no
-    /// lockout, so they are coalesced in memory and not flushed — this denies a
-    /// no-factor attacker who hits the pre-Argon2 TOTP early-exit a full
-    /// temp+fsync+rename of the entire vault per attempt. Skipping them is safe:
-    /// the on-disk counter then only ever lags (it can over-count a future
-    /// attempt via [`Self::merge_lockout`], never under-count within a live
-    /// process), and the advisory counter is explicitly not a security boundary
-    /// (the HSM-native DA lockout is). From the threshold up, every failure is
-    /// persisted so `last_failure` keeps refreshing and the window escalates.
+    /// Persisting each failure (not only the threshold-crossing one) is what
+    /// makes the advisory timer work for the software (Secret Service) backend,
+    /// which has no hardware DA lockout to fall back on: the advisory counter is
+    /// then the *only* passman-side throttle, so a restart-per-attempt attacker
+    /// must accumulate failures on disk for the 10-minute window to ever engage
+    /// across process restarts. (Coalescing sub-threshold failures in memory was
+    /// an unprofiled write optimization that defeated this cross-process
+    /// accumulation; it has been reverted.) The in-process `lockout_mem` cache
+    /// is kept in sync (disk == cache after each write), so [`Self::merge_lockout`]
+    /// becomes a no-op but is retained as a fail-safe backstop.
     ///
     /// A persist failure is intentionally swallowed — failing to write the
     /// advisory counter must not change the (already determined)
@@ -568,16 +569,14 @@ impl<H: HardwareKeyStore> App<H> {
     ) {
         *state = state.after_failure(now);
         vault.set_rate_limit(state.counter, state.last_failure);
-        // Adopt the new count so a later attempt in this process keeps escalating
-        // even when the disk write below is skipped.
+        // Keep the in-process cache in sync so a later attempt in this process
+        // keeps escalating even if the best-effort disk write below fails.
         *self
             .lockout_mem
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = *state;
-        if crate::lockout::lockout_minutes(state.counter) > 0 {
-            // Best-effort persistence; see the doc comment.
-            let _ = crate::storage::atomic_write(&self.vault_path, &vault.to_bytes());
-        }
+        // Best-effort persistence on every failure; see the doc comment.
+        let _ = crate::storage::atomic_write(&self.vault_path, &vault.to_bytes());
     }
 
     /// Build an [`UnlockedApp`] with a fresh session token and a 120 s expiry.
