@@ -21,6 +21,12 @@ pub const RECOVERY_INFO: &[u8] = b"recovery-export-v0";
 ///
 /// All presets use `p = 1`: as in the vault design, memory cost is the real
 /// GPU/ASIC barrier and raising parallelism mostly helps the attacker too.
+///
+/// Note: *restoring* a recovery file re-runs Argon2id at the file's own memory
+/// cost (`passman_crypto::argon2id` refuses costs that exceed the host's RAM),
+/// so a file created at a high preset must be restored on a machine with
+/// comparable RAM (Default ≈ ≥5 GiB, Paranoid ≈ ≥9 GiB). Choose `Floor` if the
+/// backup must be restorable on a constrained/mobile device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryPreset {
     /// Floor: 1 GiB, t = 4, p = 1 (~2.5 s). `export` refuses anything weaker.

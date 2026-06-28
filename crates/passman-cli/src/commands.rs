@@ -513,7 +513,11 @@ where
             &(),
             env.prompter,
         )
-        .context("recovery import failed (wrong password or corrupt file)")?;
+        .context(
+            "recovery import failed: wrong recovery password, a corrupt file, or not \
+             enough memory on this machine for the recovery file's Argon2 cost — a file \
+             created at a high preset must be restored on a machine with comparable RAM",
+        )?;
 
     env.io
         .err("Re-provision your authenticator with this TOTP secret (shown once):");
