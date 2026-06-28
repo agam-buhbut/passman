@@ -23,11 +23,18 @@ const DERIVED_KEY_LEN: usize = 32;
 /// headers (the vault and recovery files), and the `argon2` crate itself caps
 /// `m`/`t` only at `u32::MAX` (~4 TiB). Without a ceiling a hostile header could
 /// force a multi-terabyte allocation or a multi-hour derivation *before* any
-/// authentication can fail — a pre-auth resource-exhaustion `DoS` (fatal on
-/// mobile). These ceilings are the universal anti-DoS guardrail; they sit at the
-/// strongest shipped preset (the recovery "Paranoid" preset is 8 GiB / t = 12)
-/// so every legitimate configuration is still admitted. A per-context *strength
-/// floor* (e.g. the recovery Floor) is a separate caller policy.
+/// authentication can fail — a pre-auth resource-exhaustion `DoS`. This static
+/// ceiling sits at the strongest shipped preset (the recovery "Paranoid" preset
+/// is 8 GiB / t = 12) so every shipped configuration is *structurally* admitted.
+///
+/// The static ceiling alone does **not** prevent the `DoS`: reproducing an
+/// Argon2 hash inherently requires its full memory cost, and 8 GiB exceeds the
+/// RAM of most mobile devices and many desktops, so an in-range-but-too-large
+/// `m` still OOM-kills (or `handle_alloc_error`-aborts) the process pre-auth.
+/// [`argon2id`] therefore applies an additional **host-aware** check that
+/// refuses any derivation whose memory cost would not fit this machine, *before*
+/// the allocation. A per-context *strength floor* (e.g. the recovery Floor) is a
+/// separate caller policy.
 pub const MAX_M_KIB: u32 = 8 * 1024 * 1024;
 
 /// Maximum accepted Argon2id time cost (passes). See [`MAX_M_KIB`].
@@ -124,6 +131,41 @@ impl KdfParams {
     }
 }
 
+/// Whether an Argon2 memory cost of `m_kib` KiB is safely satisfiable given
+/// `available_kib` KiB of currently-available system memory.
+///
+/// Requires the working set to fit within 80% of available memory, leaving
+/// headroom for the rest of the process and allocator overhead and avoiding
+/// swap thrash. Pure (no I/O) so it is unit-tested directly.
+fn memory_cost_fits(m_kib: u32, available_kib: u64) -> bool {
+    // ponytail: 80%-of-MemAvailable headroom heuristic. Tune the fraction if a
+    // legitimate heavy KDF on a tight box is wrongly refused.
+    u64::from(m_kib) <= available_kib / 5 * 4
+}
+
+/// Best-effort currently-available system memory in KiB, or `None` when it
+/// cannot be determined (non-Linux targets, or `/proc/meminfo` unreadable). A
+/// `None` result means the host-aware check is skipped and only the static
+/// [`MAX_M_KIB`] ceiling applies.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn available_memory_kib() -> Option<u64> {
+    // `MemAvailable` (kernel >= 3.14) is the right metric: it estimates RAM
+    // obtainable without swapping, accounting for reclaimable cache. The value
+    // is already in KiB (the trailing "kB" is a misnomer for KiB by convention).
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            return rest.split_whitespace().next()?.parse::<u64>().ok();
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn available_memory_kib() -> Option<u64> {
+    None
+}
+
 /// Derive a 256-bit key from `password` and `salt` using Argon2id (v1.3).
 ///
 /// The output is written straight into a zeroizing [`SecretArray<32>`]; no
@@ -132,9 +174,10 @@ impl KdfParams {
 /// # Errors
 ///
 /// Returns [`CryptoError::Kdf`] if the parameters are structurally invalid
-/// (e.g. memory cost below the algorithm minimum) or the derivation itself
-/// fails. The error message comes from the `argon2` crate and never contains
-/// the password.
+/// (e.g. memory cost below the algorithm minimum), if the requested memory cost
+/// would exceed this host's available RAM (a pre-auth resource-exhaustion
+/// guard — see [`MAX_M_KIB`]), or if the derivation itself fails. The error
+/// message never contains the password.
 pub fn argon2id(
     password: &SecretString,
     salt: &[u8],
@@ -147,6 +190,21 @@ pub fn argon2id(
         return Err(CryptoError::Kdf(
             "Argon2id parameters are outside the permitted range".to_owned(),
         ));
+    }
+
+    // Host-aware backstop: an in-range `m` can still exceed *this* machine's RAM
+    // (a tampered header, or a legitimate file created on a larger device), and
+    // the `argon2` crate aborts via `handle_alloc_error` / the OS OOM-kills the
+    // process — a pre-auth `DoS` the static ceiling cannot catch. Refuse cleanly
+    // *before* allocating. Skipped only when available memory is unknowable.
+    if let Some(available_kib) = available_memory_kib() {
+        if !memory_cost_fits(params.m_kib, available_kib) {
+            return Err(CryptoError::Kdf(format!(
+                "Argon2id memory cost ({} KiB) exceeds the safe budget for this host \
+                 ({available_kib} KiB available)",
+                params.m_kib,
+            )));
+        }
     }
 
     let argon_params = Params::new(
@@ -175,8 +233,23 @@ pub fn argon2id(
 
 #[cfg(test)]
 mod tests {
-    use super::{argon2id, KdfParams, MAX_M_KIB, MAX_P, MAX_T};
+    use super::{argon2id, memory_cost_fits, KdfParams, MAX_M_KIB, MAX_P, MAX_T};
     use crate::secret::SecretString;
+
+    #[test]
+    fn memory_cost_fits_enforces_host_headroom() {
+        // Within 80% of available memory is allowed; the 80% boundary is inclusive.
+        assert!(memory_cost_fits(1, 1_000));
+        assert!(memory_cost_fits(800, 1_000));
+        // Low preset (256 MiB) on a 1 GiB box.
+        assert!(memory_cost_fits(262_144, 1_000_000));
+        // Above 80% is refused — the A12 pre-auth DoS region.
+        assert!(!memory_cost_fits(801, 1_000));
+        // The exact A12 reproducer shape: 8 GiB requested, ~3 GiB available.
+        assert!(!memory_cost_fits(8 * 1024 * 1024, 3_000_000));
+        // Default recovery preset (4 GiB) is not importable on a sub-5-GiB host.
+        assert!(!memory_cost_fits(4 * 1024 * 1024, 3_600_000));
+    }
 
     #[test]
     fn within_limits_accepts_all_presets() {
