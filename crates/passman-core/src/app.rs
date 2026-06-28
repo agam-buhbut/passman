@@ -11,14 +11,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use passman_crypto::{
-    argon2id, hkdf_master, random_secret, KdfParams, MasterKey, SecretArray, SecretBytes,
-    SecretString,
+    argon2id, hkdf_master, random_secret, CryptoError, KdfParams, MasterKey, SecretArray,
+    SecretBytes, SecretString,
 };
 use passman_hsm::{
     BiometricPrompter, HardwareKeyStore, HsmError, HsmKind, HsmLockoutStatus, HsmSlot, WrappedBlob,
 };
 use passman_totp::{Clock, TotpConfig, TotpVerifier};
 use passman_vault::{Vault, VaultMetadata};
+use zeroize::Zeroize;
 
 use crate::error::{CoreError, UnlockError};
 use crate::lockout::LockoutState;
@@ -254,6 +255,18 @@ impl<H: HardwareKeyStore> App<H> {
         let mut vault =
             Vault::from_bytes(&bytes).map_err(|e| UnlockError::MalformedVault(e.into()))?;
 
+        // A header whose Argon2id cost is out of range is hostile/corrupt: a real
+        // KDF here would be a pre-auth resource-exhaustion DoS (a multi-terabyte
+        // alloc / multi-hour derivation). `argon2id` rejects it as a backstop, but
+        // only after the biometric unwraps and mislabelled as `BadCredentials`;
+        // reject the malformed header up front, before any prompt or derivation
+        // (B1; `architecture.md` §4.7). The hostile header is effectively malformed.
+        if !vault.kdf_params().within_limits() {
+            return Err(UnlockError::MalformedVault(CoreError::Crypto(
+                CryptoError::Kdf("vault KDF parameters are outside the permitted range".to_owned()),
+            )));
+        }
+
         let now = self.clock.now();
         let mut state = LockoutState::new(vault.rl_counter(), vault.rl_last_failure());
 
@@ -270,6 +283,16 @@ impl<H: HardwareKeyStore> App<H> {
             return Err(UnlockError::LockedOut { remaining });
         }
 
+        // Advisory-lockout check (UX layer; §4.9). Evaluated *before* the unwraps
+        // (mirroring the HSM-native pre-check above) so a soft-locked-out user is
+        // refused up front instead of being prompted twice and then rejected.
+        // `state`/`now` are immutable across the unwraps, so this is the sole
+        // advisory gate; the HSM-native check above remains the real control and
+        // keeps precedence when both windows are active.
+        if let Some(remaining) = state.remaining(now) {
+            return Err(UnlockError::LockedOut { remaining });
+        }
+
         // Steps 1–2 (cont.): unwrap both slots. Map HsmError per §4.3.
         let k_hsm = self.unwrap_slot(HsmSlot::VaultKey, vault.k_hsm_wrap_blob(), ctx, prompter)?;
         let seed = self.unwrap_slot(
@@ -278,12 +301,6 @@ impl<H: HardwareKeyStore> App<H> {
             ctx,
             prompter,
         )?;
-
-        // Advisory-lockout check (UX layer; §4.9). The HSM's native DA protection
-        // checked above is the real control.
-        if let Some(remaining) = state.remaining(now) {
-            return Err(UnlockError::LockedOut { remaining });
-        }
 
         // Step 4: verify the TOTP code against the long-lived verifier.
         //
@@ -622,7 +639,10 @@ fn into_key(bytes: &SecretBytes) -> Option<SecretArray<KEY_LEN>> {
         let mut arr = [0u8; KEY_LEN];
         arr.copy_from_slice(bytes.expose());
         let key = SecretArray::new(arr);
-        arr.fill(0);
+        // `arr` is `Copy` and unused hereafter, so `fill(0)` would be a dead
+        // non-volatile store the optimizer may elide. `zeroize` is a volatile,
+        // non-elidable write — the key copy must not survive on the stack.
+        arr.zeroize();
         Some(key)
     } else {
         None

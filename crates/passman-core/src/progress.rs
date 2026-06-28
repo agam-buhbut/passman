@@ -104,3 +104,57 @@ impl Drop for ProgressGuard {
         let _ = self.progress.end();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    use super::{Progress, ProgressError, ProgressGuard};
+
+    /// A [`Progress`] that tallies `start` / `end` calls.
+    #[derive(Default)]
+    struct Counts {
+        starts: AtomicU64,
+        ends: AtomicU64,
+    }
+
+    struct Counter(Arc<Counts>);
+
+    impl Progress for Counter {
+        fn start(&self, _label: String) -> Result<(), ProgressError> {
+            self.0.starts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn end(&self) -> Result<(), ProgressError> {
+            self.0.ends.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn end_fires_on_early_return_via_question_mark() {
+        // The success-balanced bracket is covered end-to-end at
+        // `tests/core.rs::progress_brackets_each_argon2_operation`. This pins the
+        // RAII contract on the *error* path: a `?` bail-out mid-bracket must still
+        // run `end` as the guard drops while unwinding the stack frame.
+        let counts = Arc::new(Counts::default());
+        let progress: Arc<dyn Progress> = Arc::new(Counter(counts.clone()));
+
+        let bracketed = || -> Result<(), ProgressError> {
+            let _pg = ProgressGuard::start(&progress, "work");
+            // Propagate an error before reaching the end of the bracket.
+            Err(ProgressError)?;
+            Ok(())
+        };
+
+        assert!(bracketed().is_err());
+        assert_eq!(counts.starts.load(Ordering::SeqCst), 1, "start fired once");
+        assert_eq!(
+            counts.ends.load(Ordering::SeqCst),
+            1,
+            "end must fire on the `?` early-return path",
+        );
+    }
+}

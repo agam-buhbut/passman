@@ -1128,3 +1128,60 @@ fn import_recovery_round_trips_via_cheap_file() {
     assert_eq!(unlocked2.list_entries().expect("list2").len(), 1);
     unlocked2.lock();
 }
+
+#[test]
+fn unlock_rejects_out_of_range_kdf_params_cleanly() {
+    // B1: a hostile/corrupt header carrying an absurd Argon2id memory cost must
+    // fail unlock with a clean error BEFORE any derivation — never a panic and
+    // never a multi-terabyte allocation (a pre-auth resource-exhaustion DoS).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clock = TestClock::at(20_000_000);
+    let path = dir.path().join("vault.pmv");
+    // One shared HSM key across the create and reopen `App`s.
+    let backend = SharedMock::new();
+
+    // Create a normal vault so a structurally valid file exists on disk.
+    let uri_str;
+    {
+        let app = App::open_allowing_software_hsm(
+            path.clone(),
+            backend.clone(),
+            clock.clone() as Arc<dyn Clock>,
+        )
+        .expect("open create app");
+        let prompter = MockPrompter::authenticating();
+        let (unlocked, uri) = app
+            .create_vault(
+                &pw("Str0ng-Master-P@ssphrase!"),
+                FAST_KDF,
+                TotpConfig::default(),
+                &(),
+                &prompter,
+            )
+            .expect("create vault");
+        uri_str = uri.expose().to_owned();
+        unlocked.lock();
+    }
+
+    // Corrupt the header's `m_kib` (u32-LE) to u32::MAX KiB (~4 TiB), far above
+    // the crate ceiling. §4.7 header layout: byte 0 = format_version, byte 1 =
+    // kdf_algorithm_id, bytes 2..6 = m_kib, so m_kib starts at offset 2.
+    let mut bytes = std::fs::read(&path).expect("read vault");
+    bytes[2..6].copy_from_slice(&u32::MAX.to_le_bytes());
+    std::fs::write(&path, &bytes).expect("write corrupted vault");
+
+    // Reopen against the same backend and attempt unlock with otherwise-correct
+    // credentials. This must return promptly (no hang, no panic).
+    let seed = seed_from_uri(&uri_str);
+    let app = App::open_allowing_software_hsm(path, backend, clock.clone() as Arc<dyn Clock>)
+        .expect("reopen app");
+    let prompter = MockPrompter::authenticating();
+    let code = valid_code(&seed, clock.now_secs());
+    let err = app
+        .unlock(&pw("Str0ng-Master-P@ssphrase!"), &code, &(), &prompter)
+        .expect_err("out-of-range KDF params must be rejected");
+    assert!(
+        matches!(err, UnlockError::MalformedVault(_)),
+        "expected MalformedVault, got {err:?}",
+    );
+}

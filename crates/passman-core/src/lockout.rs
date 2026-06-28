@@ -220,4 +220,29 @@ mod tests {
         assert_eq!(r.counter, 0);
         assert_eq!(r.last_failure, 0);
     }
+
+    #[test]
+    fn forward_clock_intentionally_clears_advisory_lockout() {
+        // INTENT (pinned by this test): a *forward* clock jump deliberately clears
+        // the advisory lockout the instant `now >= unlock_at`. Unlike the backward
+        // rewind — which fails *closed* (see `backward_clock_stays_locked_for_full
+        // _window`) so an attacker cannot rewind to escape — the forward direction
+        // is intentionally NOT fail-closed: an attacker who can jump the clock
+        // forward could clear this UX timer early. That is acceptable because the
+        // advisory layer is not the security control; the HSM-native DA lockout
+        // (TPM/Keystore/NCrypt) is the authoritative anti-hammering gate (§4.9) and
+        // is unaffected by the system clock. Were this made fail-closed forward, a
+        // benign clock correction would strand a legitimate user. This test exists
+        // to make that asymmetry a deliberate, change-detected decision.
+        let st = LockoutState::new(3, 1_000); // 10-minute (600 s) window
+        let unlock_at = 1_000 + 600;
+        // One second before the boundary: still locked.
+        assert!(st.remaining(Timestamp::from_unix_secs(unlock_at - 1)).is_some());
+        // Exactly at the boundary: cleared.
+        assert!(st.remaining(Timestamp::from_unix_secs(unlock_at)).is_none());
+        // A large forward jump well past the window: also cleared (not fail-closed).
+        assert!(st
+            .remaining(Timestamp::from_unix_secs(unlock_at + 10_000_000))
+            .is_none());
+    }
 }

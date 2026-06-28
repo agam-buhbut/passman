@@ -66,12 +66,25 @@ pub trait Clipboard: Send + Sync {
 /// Carries the SHA-256 digest of what was written (computed by the
 /// [`Clipboard`] impl) and the time it was written (from the injected clock).
 /// Process-local; never serialized.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ClipboardCookie {
     /// SHA-256 of the written bytes, supplied by the [`Clipboard`] impl.
     digest: [u8; 32],
     /// When the write happened, stamped from the injected clock.
     written_at: Timestamp,
+}
+
+/// Redacted: the SHA-256 `digest` is an offline-brute-forceable commitment to the
+/// copied secret, and this cookie can cross the worker channel / `UniFFI`, so the
+/// digest is never printed; only the (non-secret) `written_at` is shown. Mirrors
+/// the redacted-`Debug` pattern on [`crate::SessionToken`].
+impl std::fmt::Debug for ClipboardCookie {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClipboardCookie")
+            .field("digest", &"***")
+            .field("written_at", &self.written_at)
+            .finish()
+    }
 }
 
 impl ClipboardCookie {

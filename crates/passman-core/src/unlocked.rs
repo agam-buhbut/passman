@@ -17,6 +17,7 @@ use passman_policy::{
 };
 use passman_recovery::{export, ExportPayload, RecoveryEntry, RecoveryPreset};
 use passman_vault::{EntryId, EntryRecord, Index, IndexEntry, Vault};
+use zeroize::Zeroize;
 
 use crate::app::{App, KEY_LEN};
 use crate::clipboard::{random_fact, ClearOutcome, Clipboard, ClipboardCookie};
@@ -633,7 +634,10 @@ fn key_from_bytes(bytes: &passman_crypto::SecretBytes) -> Option<SecretArray<KEY
         let mut arr = [0u8; KEY_LEN];
         arr.copy_from_slice(bytes.expose());
         let key = SecretArray::new(arr);
-        arr.fill(0);
+        // `arr` is `Copy` and unused hereafter, so `fill(0)` would be a dead
+        // non-volatile store the optimizer may elide. `zeroize` is a volatile,
+        // non-elidable write — the key copy must not survive on the stack.
+        arr.zeroize();
         Some(key)
     } else {
         None

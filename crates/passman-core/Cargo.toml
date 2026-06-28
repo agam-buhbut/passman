@@ -16,6 +16,7 @@ passman-recovery = { path = "../passman-recovery" }
 postcard.workspace = true
 base32.workspace = true
 thiserror.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 passman-hsm = { path = "../passman-hsm", features = ["mock"] }

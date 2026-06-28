@@ -1,10 +1,18 @@
 //! The opaque session token (`architecture.md` §5.1).
 //!
-//! A [`SessionToken`] is a random 256-bit value minted when a vault is
-//! unlocked and held only inside [`crate::UnlockedApp`]. The UI presents it on
-//! each privileged call to prove it is acting within the current unlocked
-//! session. It is process-local, never persisted, never crosses a network, and
-//! is dropped (invalidated) when the session locks.
+//! A [`SessionToken`] is a random 256-bit value minted when a vault is unlocked
+//! and held only inside [`crate::UnlockedApp`]. It is process-local, never
+//! persisted, never crosses a network, and is dropped (invalidated) when the
+//! session locks.
+//!
+//! **Currently advisory / reserved.** No API verifies a *presented* token today:
+//! the real capability gate is ownership of the `&UnlockedApp` handle — holding
+//! it *is* proof of acting within the live session, and dropping it (lock or
+//! expiry) revokes that capability. The token (and its constant-time equality
+//! below) is kept for a future *addressable*-session surface — e.g. a daemon or
+//! FFI layer that routes privileged calls by an opaque session id rather than by
+//! owning the handle. If such a surface is added, each privileged call SHOULD
+//! constant-time-verify the presented token against the live one before acting.
 //!
 //! It is **not** a substitute for fresh re-authentication: operations that must
 //! resist a hijacked session (recovery export — §7.5) re-verify the password,
@@ -18,8 +26,10 @@ const TOKEN_LEN: usize = 32;
 /// An opaque, unforgeable, process-local session handle.
 ///
 /// Equality is provided (constant-time, via the underlying secret type) so a
-/// caller can check a presented token against the live one, but the bytes are
-/// never exposed: the type is deliberately a black box.
+/// future addressable-session caller could check a presented token against the
+/// live one, but the bytes are never exposed: the type is deliberately a black
+/// box. See the module docs — the token is currently advisory; ownership of the
+/// unlocked-session handle is the load-bearing capability today.
 pub struct SessionToken {
     /// 256 bits from the OS CSPRNG, zeroized on drop by the wrapper type.
     inner: passman_crypto::SecretArray<TOKEN_LEN>,

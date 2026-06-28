@@ -11,12 +11,14 @@
 //!
 //! # Residual-secret note
 //!
-//! The intermediate base32 `String` transiently holds the seed. Core forbids
-//! `unsafe` and does not depend on `zeroize`, so that one heap buffer cannot be
-//! scrubbed in place here; the window is kept minimal (it is formatted into the
-//! result and dropped immediately). This is the same accepted userspace
-//! residual risk documented in `passman_crypto::secret` (allocator copies and
-//! swap are out of scope at the architecture level).
+//! The intermediate base32 `String` transiently holds the seed. `base32::encode`
+//! hands back a plain `String` (not a zeroizing type), and core forbids `unsafe`,
+//! so that one heap buffer cannot be scrubbed in place here; the window is kept
+//! minimal (it is formatted into the result and dropped immediately). This is an
+//! accepted residual: it matches `passman_crypto::secret`'s stance that
+//! userspace allocator copies and swap are out of scope at the architecture
+//! level. (Core does depend on `zeroize`, but only to scrub fixed-size key
+//! arrays; it is not applied to this transient `String`.)
 
 use base32::Alphabet;
 
