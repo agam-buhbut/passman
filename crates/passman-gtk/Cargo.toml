@@ -23,7 +23,9 @@ passman-totp = { path = "../passman-totp" }
 passman-vault = { path = "../passman-vault" }
 passman-hsm = { path = "../passman-hsm", features = ["tpm2", "secret-service"] }
 
-gtk4 = { workspace = true }
+# `v4_10` enables the async `gtk::FileDialog` (the modern, non-deprecated save
+# picker) used by the recovery-export save flow (B7). System GTK is 4.18.
+gtk4 = { workspace = true, features = ["v4_10"] }
 anyhow = { workspace = true }
 arboard = { workspace = true }
 sha2 = { workspace = true }

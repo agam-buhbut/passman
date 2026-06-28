@@ -5,7 +5,9 @@
 //! the GTK main loop (every 50 ms) and only ever touches widgets here.
 
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -13,10 +15,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gtk::prelude::*;
-use gtk::{glib, Align, Application, ApplicationWindow, Orientation};
+use gtk::{gio, glib, Align, Application, ApplicationWindow, Orientation};
 use gtk4 as gtk;
 
-use passman_core::{App, EntryHandle, RevealField};
+use passman_core::{App, EntryHandle, RecoveryPreset, RevealField};
 use passman_crypto::{KdfParams, SecretString};
 use passman_hsm::linux::{select_linux_backend, LinuxKeyStore};
 use passman_platform::{Paths, Settings};
@@ -225,6 +227,19 @@ struct Ui {
     add_pass: gtk::PasswordEntry,
     add_url: gtk::Entry,
     add_notes: gtk::Entry,
+    /// The top-level window — transient parent for the export modal and the
+    /// save `FileDialog` (B7).
+    window: ApplicationWindow,
+    /// Post-creation onboarding nudge: prompts the user to make a recovery
+    /// backup now (B7). Shown by the `Created` handler, hidden otherwise.
+    backup_banner: gtk::Label,
+    /// Post-creation authenticator-confirm group: a fresh-TOTP entry, a confirm
+    /// button, a dismiss button and a result label (B8). Shown by `Created`.
+    confirm_box: gtk::Box,
+    /// Fresh-TOTP entry inside [`Self::confirm_box`] (B8).
+    confirm_totp: gtk::Entry,
+    /// Result line for the authenticator-confirm step (B8).
+    confirm_result: gtk::Label,
     session: Session,
     vault_path: PathBuf,
     entries: RefCell<Vec<EntryHandle>>,
@@ -345,6 +360,62 @@ fn validate_create_form(master: &str, confirm: &str) -> CreateForm {
     }
 }
 
+/// Default filename suggested in the recovery-export save dialog (B7). The
+/// `.pmrec` extension mirrors the CLI's recovery-file convention.
+fn default_recovery_filename() -> &'static str {
+    "passman-recovery.pmrec"
+}
+
+/// Map a recovery-preset dropdown index to a [`RecoveryPreset`] (B7).
+///
+/// The dropdown is built as `["Floor", "Default", "Paranoid"]`; any unexpected
+/// index falls back to `Default` (the dropdown's own default selection).
+fn preset_from_index(index: u32) -> RecoveryPreset {
+    match index {
+        0 => RecoveryPreset::Floor,
+        2 => RecoveryPreset::Paranoid,
+        _ => RecoveryPreset::Default,
+    }
+}
+
+/// Atomically create `path` as an owner-only (0600) file and write `bytes`,
+/// flushing to disk (B7). `create_new` (`O_EXCL`) makes the create fail with
+/// [`io::ErrorKind::AlreadyExists`] rather than clobbering an existing file —
+/// closing the check-then-write TOCTOU — and the 0600 mode keeps the recovery
+/// material unreadable by other users even under a permissive umask. This
+/// mirrors the CLI's `write_new_file_0600`; it is reimplemented here so the GTK
+/// shell does not depend on the CLI crate.
+///
+/// # Errors
+///
+/// Returns the underlying [`io::Error`] if the file already exists, cannot be
+/// created with the requested mode, or the write/flush fails.
+#[cfg(unix)]
+fn write_new_file_0600(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// Non-Unix fallback: still create-new (no clobber, no TOCTOU); the 0600 mode is
+/// Unix-only, so the platform's default ACLs apply.
+///
+/// # Errors
+///
+/// Returns the underlying [`io::Error`] if the file already exists or the
+/// write/flush fails.
+#[cfg(not(unix))]
+fn write_new_file_0600(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
 /// Build the window and all wiring.
 #[allow(clippy::too_many_lines)] // cohesive widget construction; splitting hurts clarity
 fn build_ui(
@@ -463,13 +534,58 @@ fn build_ui(
     actions.append(&remove_btn);
 
     let add_btn = gtk::Button::with_label("Add entry");
+    let export_btn = gtk::Button::with_label("Back up (recovery export)");
     let lock_btn = gtk::Button::with_label("Lock");
     let header = gtk::Box::new(Orientation::Horizontal, 6);
     header.append(&add_btn);
+    header.append(&export_btn);
     let header_spacer = gtk::Box::new(Orientation::Horizontal, 0);
     header_spacer.set_hexpand(true);
     header.append(&header_spacer);
     header.append(&lock_btn);
+
+    // Onboarding nudge shown right after vault creation (B7): without a backup a
+    // lost device means a lost vault. Hidden until the `Created` handler shows it.
+    let backup_banner = gtk::Label::builder()
+        .label(
+            "Back up your vault now — use \"Back up (recovery export)\" above. \
+             Without an offline backup, a lost device means a lost vault.",
+        )
+        .wrap(true)
+        .visible(false)
+        .build();
+    backup_banner.add_css_class("warning");
+
+    // Post-creation authenticator-confirm step (B8): the user scans the URI shown
+    // in `reveal`, then proves the authenticator works before relying on it.
+    let confirm_label = gtk::Label::builder()
+        .label("Confirm your authenticator — enter a code it shows now:")
+        .wrap(true)
+        .halign(Align::Start)
+        .build();
+    let confirm_totp = gtk::Entry::builder()
+        .placeholder_text("TOTP code")
+        .max_length(8)
+        .build();
+    confirm_totp.update_property(&[gtk::accessible::Property::Label("Confirm TOTP code")]);
+    let confirm_totp_btn = gtk::Button::with_label("Confirm code");
+    confirm_totp_btn.add_css_class("suggested-action");
+    let dismiss_btn = gtk::Button::with_label("Dismiss");
+    let confirm_actions = gtk::Box::new(Orientation::Horizontal, 6);
+    confirm_actions.append(&confirm_totp_btn);
+    confirm_actions.append(&dismiss_btn);
+    // Status (polite live) region so the pass/fail line is announced (a11y).
+    let confirm_result: gtk::Label = glib::Object::builder()
+        .property("label", "")
+        .property("wrap", true)
+        .property("accessible-role", gtk::AccessibleRole::Status.to_value())
+        .build();
+    let confirm_box = gtk::Box::new(Orientation::Vertical, 6);
+    confirm_box.set_visible(false);
+    confirm_box.append(&confirm_label);
+    confirm_box.append(&confirm_totp);
+    confirm_box.append(&confirm_actions);
+    confirm_box.append(&confirm_result);
 
     let vault_box = gtk::Box::new(Orientation::Vertical, 8);
     vault_box.set_margin_top(12);
@@ -477,8 +593,10 @@ fn build_ui(
     vault_box.set_margin_start(12);
     vault_box.set_margin_end(12);
     vault_box.append(&header);
+    vault_box.append(&backup_banner);
     vault_box.append(&scroller);
     vault_box.append(&reveal);
+    vault_box.append(&confirm_box);
     vault_box.append(&actions);
     vault_box.append(&status);
     stack.add_named(&vault_box, Some("vault"));
@@ -556,6 +674,11 @@ fn build_ui(
         add_pass,
         add_url,
         add_notes,
+        window: window.clone(),
+        backup_banner: backup_banner.clone(),
+        confirm_box: confirm_box.clone(),
+        confirm_totp: confirm_totp.clone(),
+        confirm_result,
         session,
         vault_path,
         entries: RefCell::new(Vec::new()),
@@ -584,6 +707,8 @@ fn build_ui(
         &add_btn,
     );
     wire_add_page(&ui, &gen_btn, &save_btn, &cancel_btn);
+    wire_recovery_export(&ui, &export_btn);
+    wire_totp_confirm(&ui, &confirm_totp_btn, &dismiss_btn);
     wire_enter_submit(&ui);
     attach_response_poll(&ui, responses);
 
@@ -824,6 +949,167 @@ fn wire_add_page(
     }
 }
 
+/// Wire the "Back up (recovery export)" button: it pops the modal export form
+/// (B7).
+fn wire_recovery_export(ui: &Rc<Ui>, export_btn: &gtk::Button) {
+    let ui = Rc::clone(ui);
+    export_btn.connect_clicked(move |_| open_export_dialog(&ui));
+}
+
+/// Build and present the modal recovery-export form (B7): master password, a
+/// fresh TOTP code and a cost preset. On confirm the secrets are moved into a
+/// [`SecretString`] / owned `String` immediately and the widget buffers are
+/// wiped, so no plaintext lingers in the dialog after it closes.
+fn open_export_dialog(ui: &Rc<Ui>) {
+    let dialog = gtk::Window::builder()
+        .title("Back up — recovery export")
+        .modal(true)
+        .transient_for(&ui.window)
+        .default_width(380)
+        .build();
+
+    let intro = gtk::Label::builder()
+        .label(
+            "This writes a single-factor recovery backup of your vault. Store the \
+             file offline (e.g. on a USB key in a safe) and never beside your vault.",
+        )
+        .wrap(true)
+        .halign(Align::Start)
+        .build();
+    intro.add_css_class("dim-label");
+
+    let master = gtk::PasswordEntry::builder()
+        .show_peek_icon(true)
+        .placeholder_text("Master password")
+        .build();
+    master.update_property(&[gtk::accessible::Property::Label("Master password")]);
+    let code = gtk::Entry::builder()
+        .placeholder_text("Fresh TOTP code")
+        .max_length(8)
+        .build();
+    code.update_property(&[gtk::accessible::Property::Label("Fresh TOTP code")]);
+
+    let preset = gtk::DropDown::from_strings(&["Floor", "Default", "Paranoid"]);
+    preset.set_selected(1); // Default — matches preset_from_index's fallback.
+    let preset_row = gtk::Box::new(Orientation::Horizontal, 6);
+    preset_row.append(&gtk::Label::new(Some("Strength:")));
+    preset_row.append(&preset);
+
+    let confirm = gtk::Button::with_label("Export backup");
+    confirm.add_css_class("suggested-action");
+    let cancel = gtk::Button::with_label("Cancel");
+    let actions = gtk::Box::new(Orientation::Horizontal, 6);
+    actions.set_halign(Align::End);
+    actions.append(&cancel);
+    actions.append(&confirm);
+
+    let vbox = gtk::Box::new(Orientation::Vertical, 10);
+    vbox.set_margin_top(16);
+    vbox.set_margin_bottom(16);
+    vbox.set_margin_start(16);
+    vbox.set_margin_end(16);
+    vbox.append(&intro);
+    vbox.append(&master);
+    vbox.append(&code);
+    vbox.append(&preset_row);
+    vbox.append(&actions);
+    dialog.set_child(Some(&vbox));
+
+    {
+        let dialog = dialog.clone();
+        cancel.connect_clicked(move |_| dialog.close());
+    }
+    {
+        let ui = Rc::clone(ui);
+        let dialog = dialog.clone();
+        let master = master.clone();
+        let code = code.clone();
+        let preset_dd = preset.clone();
+        confirm.connect_clicked(move |_| {
+            // Move the secrets out of the widgets immediately.
+            let master_secret = SecretString::new(master.text().to_string());
+            let code_text = code.text().to_string();
+            let preset = preset_from_index(preset_dd.selected());
+            // Wipe the widget buffers now that the values are copied out, so no
+            // plaintext is left behind (finding S-medium / §5 item 1).
+            master.set_text("");
+            code.set_text("");
+            ui.session.send(Request::ExportRecovery {
+                master: master_secret,
+                code: code_text,
+                preset,
+            });
+            ui.status.set_text("Deriving recovery key (slow)…");
+            dialog.close();
+        });
+    }
+
+    dialog.present();
+}
+
+/// Wire the post-creation authenticator-confirm step (B8): "Confirm code" sends
+/// a [`Request::VerifyTotp`]; "Dismiss" hides the one-time URI and the group.
+fn wire_totp_confirm(ui: &Rc<Ui>, confirm_btn: &gtk::Button, dismiss_btn: &gtk::Button) {
+    {
+        let ui = Rc::clone(ui);
+        confirm_btn.connect_clicked(move |_| {
+            let code = ui.confirm_totp.text().to_string();
+            if code.trim().is_empty() {
+                ui.confirm_result
+                    .set_text("Enter the code your authenticator shows.");
+                return;
+            }
+            ui.confirm_result.remove_css_class("error");
+            ui.confirm_result.set_text("Checking…");
+            ui.session.send(Request::VerifyTotp { code });
+        });
+    }
+    {
+        let ui = Rc::clone(ui);
+        dismiss_btn.connect_clicked(move |_| {
+            // Explicit dismiss of the one-time URI (replaces the old silent 10 s
+            // auto-hide). Clear the sensitive label and the confirm group.
+            ui.reveal.set_text(OBSCURED);
+            ui.confirm_totp.set_text("");
+            ui.confirm_result.set_text("");
+            ui.confirm_box.set_visible(false);
+            ui.status
+                .set_text("TOTP URI hidden. If you did not save it, lock and recreate the vault.");
+        });
+    }
+}
+
+/// Apply the outcome of a recovery-export save dialog (B7): write the chosen
+/// file owner-only (0600), or surface a non-secret status on cancel/error.
+fn save_recovery_file(ui: &Rc<Ui>, result: Result<gio::File, glib::Error>, bytes: &[u8]) {
+    let Ok(gfile) = result else {
+        // A cancel (or any picker error) is not worth a scary message.
+        ui.status.set_text("Recovery backup not saved.");
+        return;
+    };
+    let Some(path) = gfile.path() else {
+        ui.status
+            .set_text("That location has no file path — choose a local file.");
+        return;
+    };
+    match write_new_file_0600(&path, bytes) {
+        Ok(()) => {
+            ui.status.set_text("Recovery backup saved.");
+            // They have an offline backup now; retire the onboarding nudge.
+            ui.backup_banner.set_visible(false);
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            ui.status
+                .set_text("A file of that name already exists — choose a new name.");
+        }
+        // The io::Error carries only path/OS detail, never the backup bytes.
+        Err(e) => {
+            ui.status
+                .set_text(&format!("Could not save the recovery backup: {e}"));
+        }
+    }
+}
+
 /// Submit the visible unlock-page form when the user presses Enter in any of its
 /// entries (finding UX-medium / §5 item 3).
 ///
@@ -906,23 +1192,23 @@ fn handle_response(ui: &Rc<Ui>, response: Response) {
             ui.create_strength.set_text("");
             ui.set_entries(entries);
             // Show the one-time TOTP provisioning URI so the user can scan it in
-            // their authenticator app. It is sensitive (it embeds the seed).
-            // Auto-hide on the same timer as a revealed secret (finding S7 / §5 item 1).
+            // their authenticator app. It is sensitive (it embeds the seed). The
+            // old silent 10 s auto-hide is gone (B8): the URI now stays until the
+            // user confirms a code or explicitly dismisses, so it cannot vanish
+            // before the authenticator has been proven to work.
             ui.reveal.set_text(provisioning_uri.expose());
+            // Onboarding nudge: prompt an offline recovery backup now (B7).
+            ui.backup_banner.set_visible(true);
+            // Authenticator-confirm step (B8): fresh entry, cleared result.
+            ui.confirm_totp.set_text("");
+            ui.confirm_result.set_text("");
+            ui.confirm_result.remove_css_class("error");
+            ui.confirm_box.set_visible(true);
             ui.status.set_text(
-                "Vault created. Scan this TOTP URI in your authenticator now — \
-                 it will hide automatically in 10 s.",
+                "Vault created. Scan this TOTP URI in your authenticator, then \
+                 confirm a code below to prove it works.",
             );
             ui.stack.set_visible_child_name("vault");
-            // Start the auto-hide timer (mirrors the Revealed handler, §5.4).
-            let ui_hide = Rc::clone(ui);
-            glib::timeout_add_seconds_local(REVEAL_HIDE_SECS, move || {
-                ui_hide.reveal.set_text(OBSCURED);
-                ui_hide.status.set_text(
-                    "TOTP URI hidden. If you did not save it, lock and recreate the vault.",
-                );
-                glib::ControlFlow::Break
-            });
         }
         Response::CreateFailed { message } => {
             ui.unlock_spinner.set_spinning(false);
@@ -935,6 +1221,9 @@ fn handle_response(ui: &Rc<Ui>, response: Response) {
             ui.master.set_text("");
             ui.totp.set_text("");
             ui.set_entries(entries);
+            // The onboarding/confirm UI belongs only to a fresh create.
+            ui.backup_banner.set_visible(false);
+            ui.confirm_box.set_visible(false);
             ui.stack.set_visible_child_name("vault");
         }
         Response::UnlockFailed { message } => {
@@ -987,6 +1276,9 @@ fn handle_response(ui: &Rc<Ui>, response: Response) {
 
             ui.set_entries(Vec::new());
             ui.status.set_text("");
+            // Drop any onboarding/confirm UI from a just-created vault.
+            ui.backup_banner.set_visible(false);
+            ui.confirm_box.set_visible(false);
             // A vault may have just been created; re-evaluate create-vs-unlock.
             ui.refresh_gate();
             ui.stack.set_visible_child_name("unlock");
@@ -1001,15 +1293,50 @@ fn handle_response(ui: &Rc<Ui>, response: Response) {
                 );
             }
         }
-        Response::Error { message } => {
+        // A non-fatal op error, or a B7 export failure: both surface a worker-
+        // built status string that never contains a secret.
+        Response::Error { message } | Response::RecoveryExportFailed { message } => {
             ui.status.set_text(&message);
         }
-        // Android-only responses (recovery export / TOTP confirm, B7/B8). The
-        // desktop shell does not yet send those requests, so it cannot receive
-        // these; ignore them here. (GTK recovery-export wiring is a follow-up.)
-        Response::RecoveryExported { .. }
-        | Response::RecoveryExportFailed { .. }
-        | Response::TotpChecked { .. } => {}
+        // B7 — the recovery backup bytes are ready; let the user pick a path.
+        Response::RecoveryExported { file } => open_recovery_save_dialog(ui, file),
+        // B8 — result of the authenticator-confirm step.
+        Response::TotpChecked { valid } => apply_totp_checked(ui, valid),
+    }
+}
+
+/// Pop a save dialog for the freshly-exported recovery bytes and write the
+/// chosen file owner-only (0600) (B7).
+fn open_recovery_save_dialog(ui: &Rc<Ui>, file: Vec<u8>) {
+    let dialog = gtk::FileDialog::builder()
+        .title("Save recovery backup")
+        .initial_name(default_recovery_filename())
+        .build();
+    let ui_cb = Rc::clone(ui);
+    // The save dialog is async/callback-based; it runs on the GTK main context
+    // this poll already lives on.
+    dialog.save(Some(&ui.window), gio::Cancellable::NONE, move |result| {
+        save_recovery_file(&ui_cb, result, &file);
+    });
+}
+
+/// Apply the result of the authenticator-confirm step (B8): on a match, dismiss
+/// the one-time URI and the confirm group; on a miss, keep the user on the step.
+fn apply_totp_checked(ui: &Rc<Ui>, valid: bool) {
+    if valid {
+        ui.confirm_result.remove_css_class("error");
+        ui.confirm_result.set_text("Authenticator confirmed ✓");
+        ui.reveal.set_text(OBSCURED);
+        ui.confirm_totp.set_text("");
+        ui.confirm_box.set_visible(false);
+        ui.status
+            .set_text("Authenticator confirmed. Back up your vault now (recovery export).");
+    } else {
+        ui.confirm_result.add_css_class("error");
+        ui.confirm_result
+            .set_text("That code didn't match — check your authenticator and try again.");
+        // Clear the failed attempt so they retype a fresh code.
+        ui.confirm_totp.set_text("");
     }
 }
 
@@ -1018,7 +1345,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        parse_opts, tier_label, tier_needs_warning, validate_create_form, CreateForm, StrengthTier,
+        default_recovery_filename, parse_opts, preset_from_index, tier_label, tier_needs_warning,
+        validate_create_form, write_new_file_0600, CreateForm, RecoveryPreset, StrengthTier,
     };
 
     /// Build an owned-`String` arg iterator (program name already stripped).
@@ -1116,5 +1444,54 @@ mod tests {
         // The generate button uses DEFAULT_LENGTH; this pins it to 40 so
         // GTK and CLI are always aligned (finding UX-medium / §5 item 4).
         assert_eq!(super::DEFAULT_LENGTH, 40);
+    }
+
+    #[test]
+    fn default_recovery_filename_has_pmrec_extension() {
+        // The save-dialog default name must carry the recovery extension (B7).
+        assert_eq!(default_recovery_filename(), "passman-recovery.pmrec");
+    }
+
+    #[test]
+    fn preset_from_index_maps_the_dropdown_order() {
+        // The dropdown is ["Floor", "Default", "Paranoid"]; out-of-range falls
+        // back to Default (the dropdown's own initial selection) (B7).
+        assert_eq!(preset_from_index(0), RecoveryPreset::Floor);
+        assert_eq!(preset_from_index(1), RecoveryPreset::Default);
+        assert_eq!(preset_from_index(2), RecoveryPreset::Paranoid);
+        assert_eq!(preset_from_index(99), RecoveryPreset::Default);
+        // GTK's "no selection" sentinel (INVALID_LIST_POSITION == u32::MAX) must
+        // not panic and must stay safe.
+        assert_eq!(preset_from_index(u32::MAX), RecoveryPreset::Default);
+    }
+
+    #[test]
+    fn write_new_file_creates_then_refuses_to_clobber() {
+        // Mirrors the CLI's recovery-writer test: create_new is the TOCTOU /
+        // clobber guard (B7).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rec.pmrec");
+        write_new_file_0600(&path, b"payload").expect("first create");
+        assert_eq!(std::fs::read(&path).expect("read back"), b"payload");
+
+        let err = write_new_file_0600(&path, b"clobber").expect_err("second create must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).expect("read back"), b"payload");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_new_file_is_owner_only_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rec.pmrec");
+        write_new_file_0600(&path, b"x").expect("create");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "recovery file must be 0600, got {:o}",
+            mode & 0o777
+        );
     }
 }
