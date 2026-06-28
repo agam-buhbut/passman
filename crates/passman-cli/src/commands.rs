@@ -1,21 +1,26 @@
 //! Command implementations, generic over the HSM backend so the integration
 //! tests drive them against the mock while `main` uses the real Linux backend.
 
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use passman_core::{App, Clipboard, UnlockError, UnlockedApp};
+use passman_core::{App, ClearOutcome, Clipboard, UnlockError, UnlockedApp};
 use passman_crypto::SecretString;
 use passman_hsm::{BiometricPrompter, HardwareKeyStore};
 use passman_platform::{Paths, Settings};
 use passman_policy::{classify, estimate_master, EntryPolicy, GenerationRequest};
 use passman_totp::Clock;
 use passman_vault::{EntryId, EntryRecord};
+use zeroize::Zeroizing;
 
 use crate::cli::{default_length, entry_record, Command, Field, Preset, RecPreset};
 use crate::io::Io;
+use crate::process::{tagged, ExitClass};
 
 /// Everything a command needs besides the backend-owning [`App`].
 pub struct CliEnv<'a, I: Io, C: Clipboard> {
@@ -102,9 +107,10 @@ where
         App::open(path, backend, env.clock.clone())
     };
     opened.map_err(|e| match e {
-        passman_core::CoreError::AlreadyRunning => {
-            anyhow!("another passman instance is already using this vault")
-        }
+        passman_core::CoreError::AlreadyRunning => tagged(
+            ExitClass::AlreadyRunning,
+            "another passman instance is already using this vault",
+        ),
         other => anyhow!(other).context("could not open the vault"),
     })
 }
@@ -128,10 +134,16 @@ where
 #[allow(clippy::needless_pass_by_value)]
 fn unlock_error(e: UnlockError) -> anyhow::Error {
     match e {
-        UnlockError::BadCredentials => anyhow!("incorrect master password or TOTP code"),
-        UnlockError::LockedOut { remaining } => anyhow!(
-            "locked out; try again in about {} s",
-            remaining.as_secs().max(1)
+        UnlockError::BadCredentials => tagged(
+            ExitClass::AuthFailed,
+            "incorrect master password or TOTP code",
+        ),
+        UnlockError::LockedOut { remaining } => tagged(
+            ExitClass::LockedOut,
+            format!(
+                "locked out; try again in about {} s",
+                remaining.as_secs().max(1)
+            ),
         ),
         UnlockError::Cancelled => anyhow!("unlock cancelled"),
         UnlockError::Retryable => anyhow!("transient hardware error during unlock; please retry"),
@@ -160,7 +172,7 @@ where
         .filter(|h| h.label == label);
     let first = matching
         .next()
-        .ok_or_else(|| anyhow!("no entry labelled {label:?}"))?;
+        .ok_or_else(|| tagged(ExitClass::NotFound, format!("no entry labelled {label:?}")))?;
     if matching.next().is_some() {
         bail!(
             "several entries are labelled {label:?}; labels must be unique to address one by name"
@@ -349,23 +361,31 @@ where
     let id = find_entry(&unlocked, label)?;
 
     if show {
-        let value = unlocked.with_revealed(&id, |r| field_string(r, field))?;
-        env.io.out(&value);
+        // Hold the revealed field in a zeroizing buffer so the plaintext is
+        // scrubbed the instant it leaves scope, instead of lingering in a plain
+        // `String` after printing (#3). `field_string`'s allocation is moved in,
+        // not copied, so this is the only heap copy and it is wiped on drop.
+        let value = unlocked.with_revealed(&id, |r| Zeroizing::new(field_string(r, field)))?;
+        env.io.out(value.as_str());
         return Ok(());
     }
 
     let cookie = unlocked.copy_to_clipboard(&id, field.into(), env.clipboard)?;
     let secs = env.clipboard_clear.as_secs();
     env.io.err(&format!(
-        "Copied to the clipboard; it will be cleared in {secs} s."
+        "Copied to the clipboard; it will be cleared in {secs} s (or on Ctrl-C)."
     ));
-    env.io.sleep(env.clipboard_clear);
+    // Wait in short ticks so a SIGINT/SIGTERM (whose handler only flips an atomic
+    // flag — the sole async-signal-safe action) ends the wait promptly and the
+    // secret is still scrubbed here, in normal code, never from the handler (#2).
+    // Best-effort: a SIGKILL cannot be caught, so it can still strand the secret.
+    wait_for_clear(env.io, env.clipboard_clear, &CLIPBOARD_CLEAR_REQUESTED);
     let outcome = unlocked.clear_clipboard_with(
         &cookie,
         env.clipboard,
         env.settings.clipboard_fact_overwrite,
     );
-    env.io.err(&format!("Clipboard cleared ({outcome:?})."));
+    env.io.err(clear_status_message(outcome));
     Ok(())
 }
 
@@ -396,9 +416,17 @@ where
     I: Io,
     C: Clipboard,
 {
+    // Cheap advisory pre-check so the user learns the path is taken immediately,
+    // rather than after re-auth + the deliberately-slow recovery derivation. The
+    // authoritative guard is still the atomic create_new (O_EXCL) write below;
+    // this is pure UX and losing the race there fails safely.
     if file.exists() {
-        bail!("{} already exists; choose a different path", file.display());
+        return Err(anyhow!(
+            "{} already exists; choose a different path",
+            file.display()
+        ));
     }
+
     let mut unlocked = unlock(app, env)?;
 
     env.io.err(
@@ -419,7 +447,16 @@ where
         )
         .map_err(export_error)?;
 
-    std::fs::write(file, &bytes).with_context(|| format!("could not write {}", file.display()))?;
+    // Atomic, owner-only write: `create_new` (O_EXCL) refuses to clobber and
+    // closes the old check-then-write TOCTOU; 0600 keeps the recovery material
+    // unreadable by other users even under a lax umask (#1).
+    write_new_file_0600(file, &bytes).map_err(|e| {
+        if e.kind() == io::ErrorKind::AlreadyExists {
+            anyhow!("{} already exists; choose a different path", file.display())
+        } else {
+            anyhow::Error::new(e).context(format!("could not write {}", file.display()))
+        }
+    })?;
     env.io.err(&format!(
         "Recovery file written to {}. Store it somewhere safe.",
         file.display()
@@ -481,15 +518,12 @@ where
     env.io
         .err("Re-provision your authenticator with this TOTP secret (shown once):");
     env.io.out(uri.expose());
+    let n = unlocked.list_entries()?.len();
     env.io.err(&format!(
         "Vault restored to {} with {} entr{}.",
         env.paths.vault().display(),
-        unlocked.list_entries()?.len(),
-        if unlocked.list_entries()?.len() == 1 {
-            "y"
-        } else {
-            "ies"
-        }
+        n,
+        if n == 1 { "y" } else { "ies" }
     ));
     unlocked.lock();
     Ok(())
@@ -524,7 +558,8 @@ where
 }
 
 /// Extract one field of a decrypted record as an owned `String` (used by
-/// `get --show`).
+/// `get --show`). The caller wraps this in [`Zeroizing`] so the plaintext is
+/// scrubbed promptly (#3).
 fn field_string(record: &EntryRecord, field: Field) -> String {
     let secret = match field {
         Field::Username => &record.username,
@@ -533,4 +568,193 @@ fn field_string(record: &EntryRecord, field: Field) -> String {
         Field::Notes => &record.notes,
     };
     secret.expose().to_owned()
+}
+
+// ----- Clipboard-clear wait + signal flag (#2, #5) ---------------------------
+
+/// How long each clipboard-clear wait tick sleeps. Short enough that a SIGINT /
+/// SIGTERM is honoured within ~one tick instead of blocking the full 30 s
+/// budget; long enough not to busy-spin.
+const CLEAR_TICK: Duration = Duration::from_millis(200);
+
+/// Set by the binary's SIGINT/SIGTERM handler (via [`request_clipboard_clear`])
+/// so the `get` copy wait can end early and scrub the secret instead of leaving
+/// it on the clipboard (#2). The handler only flips this flag; the clear itself
+/// runs in normal code ([`cmd_get`]).
+static CLIPBOARD_CLEAR_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Request that an in-progress `get` clipboard-clear wait end now.
+///
+/// Called from the binary's signal handler. Async-signal-safe: a single atomic
+/// store, with no allocation, locking, or other non-reentrant work.
+pub fn request_clipboard_clear() {
+    CLIPBOARD_CLEAR_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// Wait up to `budget` for the post-copy clipboard clear, returning early the
+/// moment `interrupted` is set. Sleeps in [`CLEAR_TICK`] increments through the
+/// injected [`Io`], so production sleeps for real while tests (zero budget)
+/// return instantly. `interrupted` is a parameter (not the global directly) so
+/// the tick/flag logic is unit-testable without delivering a real signal.
+fn wait_for_clear<I: Io>(io: &mut I, budget: Duration, interrupted: &AtomicBool) {
+    let mut waited = Duration::ZERO;
+    while waited < budget {
+        if interrupted.load(Ordering::SeqCst) {
+            break;
+        }
+        let tick = CLEAR_TICK.min(budget.saturating_sub(waited));
+        io.sleep(tick);
+        waited += tick;
+    }
+}
+
+/// A human-readable line for a clipboard-clear [`ClearOutcome`], instead of
+/// printing the internal enum's `Debug` (#5).
+fn clear_status_message(outcome: ClearOutcome) -> &'static str {
+    match outcome {
+        ClearOutcome::Cleared => "Clipboard cleared.",
+        ClearOutcome::StillOurs => {
+            "Clipboard left in place (fact-overwrite is disabled in settings)."
+        }
+        ClearOutcome::Replaced => "Clipboard left unchanged — its contents were no longer ours.",
+        ClearOutcome::Empty => "Clipboard was already empty.",
+        ClearOutcome::Unavailable => "Clipboard could not be accessed to clear it.",
+    }
+}
+
+// ----- Atomic, owner-only recovery file write (#1) ---------------------------
+
+/// Atomically create `path` as an owner-only (0600) file and write `bytes`,
+/// flushing to disk. `create_new` (`O_EXCL`) makes the create fail with
+/// [`io::ErrorKind::AlreadyExists`] rather than clobbering an existing file —
+/// closing the check-then-write TOCTOU — and the 0600 mode keeps the recovery
+/// material unreadable by other users even under a permissive umask (#1).
+#[cfg(unix)]
+fn write_new_file_0600(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// Non-Unix fallback: still create-new (no clobber, no TOCTOU); the 0600 mode is
+/// Unix-only, so the platform's default ACLs apply.
+#[cfg(not(unix))]
+fn write_new_file_0600(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        clear_status_message, wait_for_clear, write_new_file_0600, ClearOutcome, Duration, Io,
+    };
+    use std::sync::atomic::AtomicBool;
+
+    /// A minimal [`Io`] that only counts `sleep` calls — enough to observe the
+    /// clipboard-clear tick loop without a real terminal or clock.
+    struct CountIo {
+        sleeps: usize,
+    }
+
+    impl Io for CountIo {
+        fn read_secret(&mut self, _: &str) -> std::io::Result<passman_crypto::SecretString> {
+            unreachable!("wait_for_clear never reads input")
+        }
+        fn read_line(&mut self, _: &str) -> std::io::Result<String> {
+            unreachable!("wait_for_clear never reads input")
+        }
+        fn out(&mut self, _: &str) {}
+        fn err(&mut self, _: &str) {}
+        fn sleep(&mut self, _: Duration) {
+            self.sleeps += 1;
+        }
+    }
+
+    #[test]
+    fn a_set_interrupt_flag_skips_the_clipboard_wait() {
+        // Models a SIGINT landing before the wait: the loop must clear at once,
+        // never sleeping the budget away (the injectable-flag check from #2).
+        let flag = AtomicBool::new(true);
+        let mut io = CountIo { sleeps: 0 };
+        wait_for_clear(&mut io, Duration::from_secs(30), &flag);
+        assert_eq!(io.sleeps, 0, "a set flag must short-circuit the wait");
+    }
+
+    #[test]
+    fn a_clear_flag_sleeps_in_ticks_through_the_budget() {
+        let flag = AtomicBool::new(false);
+        let mut io = CountIo { sleeps: 0 };
+        wait_for_clear(&mut io, Duration::from_millis(600), &flag);
+        assert_eq!(io.sleeps, 3, "600 ms / 200 ms tick = 3 ticks");
+    }
+
+    #[test]
+    fn a_zero_budget_never_sleeps() {
+        let flag = AtomicBool::new(false);
+        let mut io = CountIo { sleeps: 0 };
+        wait_for_clear(&mut io, Duration::ZERO, &flag);
+        assert_eq!(io.sleeps, 0, "tests use a zero budget and must not sleep");
+    }
+
+    #[test]
+    fn clear_status_messages_are_human_sentences() {
+        assert_eq!(
+            clear_status_message(ClearOutcome::Cleared),
+            "Clipboard cleared."
+        );
+        assert_eq!(
+            clear_status_message(ClearOutcome::Replaced),
+            "Clipboard left unchanged — its contents were no longer ours."
+        );
+        // No variant leaks the raw enum `Debug` form to the user.
+        for outcome in [
+            ClearOutcome::Cleared,
+            ClearOutcome::StillOurs,
+            ClearOutcome::Replaced,
+            ClearOutcome::Empty,
+            ClearOutcome::Unavailable,
+        ] {
+            assert!(
+                !clear_status_message(outcome).contains("ClearOutcome"),
+                "status must read as prose, not Debug"
+            );
+        }
+    }
+
+    #[test]
+    fn write_new_file_creates_then_refuses_to_clobber() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rec.pmr");
+        write_new_file_0600(&path, b"payload").expect("first create");
+        assert_eq!(std::fs::read(&path).expect("read back"), b"payload");
+
+        // A second create_new on the same path is the TOCTOU/clobber guard: it
+        // must fail with AlreadyExists and leave the original intact (#1).
+        let err = write_new_file_0600(&path, b"clobber").expect_err("second create must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).expect("read back"), b"payload");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_new_file_is_owner_only_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rec.pmr");
+        write_new_file_0600(&path, b"x").expect("create");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "recovery file must be 0600, got {:o}",
+            mode & 0o777
+        );
+    }
 }

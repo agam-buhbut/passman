@@ -194,6 +194,14 @@ impl KeystoreWrapper for KeystoreAdapter {
         slot_tag: u8,
         material: &[u8],
     ) -> Result<WrappedParts, KeystoreError> {
+        // `material.to_vec()` is a transient plaintext heap copy handed by value
+        // across the FFI to the Kotlin `KeystoreBridge.wrap`. UniFFI *moves* the
+        // Vec across the boundary, so it cannot be zeroized here without first
+        // taking an extra, unscrubbed copy to scrub afterwards — strictly worse.
+        // This is an accepted, inherent FFI residual (H3): the canonical secret
+        // is the caller's zeroizing SecretBytes (still intact), the Kotlin side
+        // scrubs its own copy (`material.fill(0)`), and this is the one
+        // unavoidable plaintext hop between the two.
         let out = self.0.wrap(alias.to_owned(), slot_tag, material.to_vec())?;
         let iv =
             <[u8; GCM_IV_LEN]>::try_from(out.iv.as_slice()).map_err(|_| KeystoreError::Backend)?;
@@ -552,14 +560,47 @@ impl PassmanApp {
         }
     }
 
-    /// Lock the session (drop the keys).
+    /// Lock the session (drop the keys). **Fire-and-forget**, exactly like
+    /// [`PassmanApp::clear_clipboard`]: it takes the lock only to `send`, then
+    /// returns without awaiting the worker's reply.
+    ///
+    /// Android calls this from `ON_STOP` on the main thread; routing it through
+    /// the blocking [`PassmanApp::call`] would let an in-flight op stall the UI
+    /// for its full duration (an ANR), and a wedged op holding the mutex across
+    /// `recv` would freeze every entrypoint. The worker's resulting
+    /// `Response::Locked` becomes an unsolicited response that the drain at the
+    /// top of `call` discards before the next paired request (see `call`).
     pub fn lock(&self) {
-        let _ = self.call(Request::Lock);
+        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        inner.session.send(Request::Lock);
     }
 }
 
 impl PassmanApp {
-    /// Send one request and wait for the worker's single response, serialized.
+    /// Send one request and block for the worker's single matching response.
+    ///
+    /// # Single-worker serialization model
+    ///
+    /// Every foreign entrypoint that needs a reply routes through here, and
+    /// `call` holds `self.inner`'s mutex across the blocking `recv`. This is by
+    /// design: the worker is single-threaded, so only one operation ever runs at
+    /// a time, and serializing the whole request->response pair under one lock is
+    /// what keeps each `recv` aligned one-to-one with the request it just sent.
+    ///
+    /// The lifecycle entrypoints [`PassmanApp::lock`] and
+    /// [`PassmanApp::clear_clipboard`] are intentionally non-blocking (they take
+    /// the lock only to `send`, never to `recv`) so an Android `ON_STOP` /
+    /// auto-clear callback never waits on an in-flight op. `lock`'s worker-side
+    /// `Response::Locked` is left in the channel as an unsolicited response; the
+    /// drain below discards it before the next paired request, so pairing stays
+    /// one-to-one (`clear_clipboard` produces no response at all).
+    ///
+    /// Known limitation: a *hung* backend op — e.g. a wedged `BiometricPrompt`
+    /// inside a `KeystoreBridge::unwrap` — holds this mutex until it returns, so
+    /// while it is stuck every other entrypoint blocks here too. The proper fix
+    /// is per-call response channels (one reply channel per request, no shared
+    /// mutex held across `recv`); that is future work and deliberately not done
+    /// in this change.
     fn call(&self, request: Request) -> Response {
         let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         // Discard any unsolicited responses (notably a proactive auto-lock

@@ -53,6 +53,41 @@ fn harden_process() {
 #[cfg(not(target_os = "linux"))]
 fn harden_process() {}
 
+/// Async-signal-safe SIGINT/SIGTERM handler for the `get` copy path: it does
+/// nothing but flip the atomic flag the clipboard-clear loop polls — no
+/// allocation, locking, or I/O — so an interrupt during the wait still scrubs
+/// the secret (the clear itself runs in normal code).
+#[cfg(target_os = "linux")]
+extern "C" fn on_clipboard_signal(_sig: libc::c_int) {
+    passman_cli::request_clipboard_clear();
+}
+
+/// Install [`on_clipboard_signal`] for SIGINT and SIGTERM. Best-effort: a failed
+/// `sigaction` just leaves the default (terminate) disposition, so the only cost
+/// is losing the early clipboard scrub on Ctrl-C — the 30 s timer still fires if
+/// the process survives. A caught SIGINT/SIGTERM lets the wait end early; a
+/// SIGKILL cannot be caught and can still strand the secret.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn install_clipboard_signal_handler() {
+    // SAFETY: `action` is a fully-initialised, stack-local `sigaction`; the
+    // handler is async-signal-safe (a lone atomic store) and the signal numbers
+    // are constants. `&raw const` / `&raw mut` avoid an implicit borrow-as-ptr
+    // (clippy::borrow_as_ptr), matching harden_process above.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        // Cast via a thin pointer first (function_casts_as_integer): the field
+        // is a `size_t`-typed handler slot, set to our `extern "C"` handler.
+        action.sa_sigaction = on_clipboard_signal as *const () as libc::sighandler_t;
+        libc::sigemptyset(&raw mut action.sa_mask);
+        libc::sigaction(libc::SIGINT, &raw const action, std::ptr::null_mut());
+        libc::sigaction(libc::SIGTERM, &raw const action, std::ptr::null_mut());
+    }
+}
+
+/// Process exit codes (the binary's status contract; see `process.rs`):
+///   `0` success · `1` general failure · `2` usage error (emitted by clap) ·
+///   `3` entry not found · `4` auth failed · `5` locked out · `6` already running.
 fn main() -> ExitCode {
     harden_process();
     match real_main() {
@@ -60,7 +95,8 @@ fn main() -> ExitCode {
         Err(e) => {
             // `{:#}` includes the anyhow context chain; never prints secrets.
             eprintln!("error: {e:#}");
-            ExitCode::FAILURE
+            // Map known error categories to distinct codes; everything else is 1.
+            passman_cli::exit_status(&e)
         }
     }
 }
@@ -98,12 +134,18 @@ fn real_main() -> Result<()> {
             // Select the real Linux backend per §6.2 (TPM2 → SecretService).
             let backend =
                 passman_hsm::linux::select_linux_backend(allow_software).map_err(|e| match e {
-                    passman_hsm::HsmError::HardwareAbsent => anyhow::anyhow!(
-                        "no TPM 2.0 found. Re-run with --allow-software-hsm to use the OS \
-                         keyring instead (weaker: no hardware lockout)."
-                    ),
+                    passman_hsm::HsmError::HardwareAbsent => {
+                        anyhow::anyhow!("{}", passman_cli::hardware_absent_message())
+                    }
                     other => anyhow::Error::new(other).context("could not select an HSM backend"),
                 })?;
+            // The copy path parks on the §5.3 clear timer; install a
+            // SIGINT/SIGTERM handler so an interrupt during that wait still
+            // scrubs the secret. Scoped to this command so every other command
+            // keeps the default terminate-on-Ctrl-C behaviour.
+            if matches!(command, Command::Get { show: false, .. }) {
+                install_clipboard_signal_handler();
+            }
             run(command, backend, &mut env)
         }
     }

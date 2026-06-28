@@ -12,10 +12,12 @@ mod cli;
 mod clipboard;
 mod commands;
 mod io;
+mod process;
 mod prompter;
 
 pub use cli::{Cli, Command, Field, Preset, RecPreset};
 pub use clipboard::SystemClipboard;
-pub use commands::{generate, run, CliEnv};
+pub use commands::{generate, request_clipboard_clear, run, CliEnv};
 pub use io::{Io, TerminalIo};
+pub use process::{exit_status, hardware_absent_message};
 pub use prompter::DesktopPrompter;

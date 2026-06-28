@@ -593,3 +593,145 @@ fn import_round_trips_a_cheap_recovery_file() {
     r.expect("list after import");
     assert_eq!(io.out, vec!["Restored".to_owned()]);
 }
+
+/// Build a deterministic source vault by hand: write a cheap recovery file with
+/// the fixed `seed` and one known entry, then `import` it. Returns the fixture
+/// holding that vault. Used by the heavy export round-trip so the re-auth TOTP
+/// codes are deterministic (a known seed) rather than a random `init` seed. The
+/// single entry is `Roundtrip` / `alice` / `entry-pw-1`.
+fn seed_vault_via_import(seed: [u8; 32], master: &str) -> Fixture {
+    use passman_policy::EntryPolicy;
+    use passman_recovery::{export_unchecked, ExportPayload, RecoveryEntry};
+
+    let fx = Fixture::new();
+    let policy = postcard::to_allocvec(&EntryPolicy::default()).expect("policy bytes");
+    let payload = ExportPayload {
+        totp_seed: passman_crypto::SecretArray::new(seed),
+        original_vault_kdf: FAST_KDF,
+        entries: vec![RecoveryEntry {
+            id: [0x11u8; 16],
+            label: "Roundtrip".to_owned(),
+            username: SecretString::new("alice".to_owned()),
+            password: SecretString::new("entry-pw-1".to_owned()),
+            url: SecretString::new("https://example.com".to_owned()),
+            notes: SecretString::new("note".to_owned()),
+            policy,
+        }],
+    };
+    let seed_file = fx
+        .paths
+        .vault()
+        .parent()
+        .expect("vault parent")
+        .join("seed.pmr");
+    std::fs::write(
+        &seed_file,
+        export_unchecked(&payload, &SecretString::new(master.to_owned()), &FAST_KDF)
+            .expect("cheap seed export"),
+    )
+    .expect("write seed file");
+    fx.run(
+        Command::Import {
+            file: seed_file,
+            preset: Preset::Low,
+        },
+        &[master],
+        &[],
+    )
+    .0
+    .expect("seed import");
+    fx
+}
+
+/// A real end-to-end `export` → `import` round-trip through the CLI, exercising
+/// the production `export_recovery` success path (Strong-master gate + fresh-TOTP
+/// re-auth) and the atomic 0600 file write, then restoring from that exact file.
+///
+/// Ignored by default: the production recovery `export` enforces a 1 GiB Argon2
+/// Floor (§7.4) that cannot be cheapened through the public CLI — the `FAST_KDF`
+/// override only governs the *vault* KDF, not the recovery KDF — so this is far
+/// too heavy/slow for the default run. The `passman-recovery` crate gates its
+/// equivalent real-preset round-trip the same way. Run on demand with
+/// `cargo test -p passman-cli -- --ignored`.
+#[test]
+#[ignore = "production recovery export runs a 1 GiB Argon2 floor; too heavy for default runs"]
+fn cli_export_import_round_trips_through_the_real_export() {
+    // A Strong recovery/master password (>= 55 zxcvbn bits) opens the §7.5 export
+    // gate — the proven-Strong example from passman-policy's own tests.
+    const STRONG: &str = "xK7#mP2$qR9vL4nB8wZ!jH3tY6&";
+    // A fixed TOTP seed makes the two re-auth codes deterministic.
+    let seed: [u8; 32] = [0x5A; 32];
+    let src = seed_vault_via_import(seed, STRONG);
+
+    // --- Real CLI export (1 GiB Floor) to a real file ---
+    let out_file = src
+        .paths
+        .vault()
+        .parent()
+        .expect("vault parent")
+        .join("backup.pmr");
+    // unlock consumes the current TOTP step; the fresh re-auth code is the next
+    // step's code (within the default ±1 skew, not a replay of the just-used one).
+    let unlock_code = valid_code(&seed, src.clock.now_secs());
+    let fresh_code = valid_code(&seed, src.clock.now_secs() + 30);
+    assert_ne!(
+        unlock_code, fresh_code,
+        "fixed seed yields distinct neighbours"
+    );
+    let (r, io) = src.run(
+        Command::Export {
+            file: out_file.clone(),
+            preset: RecPreset::Floor,
+        },
+        &[STRONG, STRONG],
+        &[&unlock_code, &fresh_code],
+    );
+    r.expect("real export");
+    assert!(io.err_contains("Recovery file written"));
+    assert!(out_file.exists(), "recovery file created");
+
+    // The exported file must be owner-only (0600) on Unix.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&out_file)
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "exported file must be 0600, got {:o}",
+            mode & 0o777
+        );
+    }
+
+    // --- Restore from that exact file into a fresh vault ---
+    let dst = Fixture::new();
+    let (r, io) = dst.run(
+        Command::Import {
+            file: out_file,
+            preset: Preset::Low,
+        },
+        &[STRONG],
+        &[],
+    );
+    r.expect("import the real export");
+    let new_seed = seed_from_uri(io.out_starting("otpauth://").expect("uri"));
+
+    let (r, io) = dst.run(Command::List, &[STRONG], &[&dst.code(&new_seed)]);
+    r.expect("list after import");
+    assert_eq!(io.out, vec!["Roundtrip".to_owned()]);
+
+    let (r, io) = dst.run(
+        Command::Get {
+            label: "Roundtrip".to_owned(),
+            show: true,
+            field: Field::Password,
+        },
+        &[STRONG],
+        &[&dst.code(&new_seed)],
+    );
+    r.expect("get password after import");
+    assert_eq!(io.out, vec!["entry-pw-1".to_owned()]);
+}

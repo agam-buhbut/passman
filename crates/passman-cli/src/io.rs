@@ -12,6 +12,11 @@ use std::time::Duration;
 use passman_crypto::SecretString;
 use zeroize::Zeroize;
 
+/// Capacity preallocated for the non-tty secret-read buffer so `read_line` does
+/// not reallocate mid-read and strand plaintext in freed heap (see the SECURITY
+/// note in `read_secret`). Generous for any realistic master password.
+const SECRET_LINE_CAPACITY: usize = 256;
+
 /// The terminal/clock surface a command needs.
 ///
 /// Data (passwords, labels) goes to stdout via [`Io::out`]; status and prompts
@@ -65,11 +70,16 @@ impl Io for TerminalIo {
         } else {
             // SECURITY: read into a plain String (there is no zeroizing
             // BufRead alternative in std), then explicitly zeroize it after
-            // moving the trimmed content into SecretString.  The trimmed
-            // copy is immediately wrapped in SecretString which zeroizes on
-            // drop; the original buffer (with the trailing newline) is
-            // scrubbed here so no plain-text copy lingers in freed heap.
-            let mut line = String::new();
+            // moving the trimmed content into SecretString. The trimmed copy is
+            // immediately wrapped in SecretString which zeroizes on drop. We
+            // preallocate a generous capacity so `read_line` does not reallocate
+            // mid-read: a reallocation would copy the partial plaintext into a
+            // fresh buffer and leave the old one in freed heap, beyond the reach
+            // of the single final zeroize below. With no reallocation the
+            // residue is bounded to this one buffer (scrubbed by
+            // `finalize_secret_line`); only a password longer than this capacity
+            // would grow it.
+            let mut line = String::with_capacity(SECRET_LINE_CAPACITY);
             if stdin.lock().read_line(&mut line)? == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
