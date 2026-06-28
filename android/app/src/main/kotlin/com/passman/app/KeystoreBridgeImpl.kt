@@ -36,7 +36,10 @@ import uniffi.passman_uniffi.WrapOutput
  *  3. IV strictly from `cipher.iv`; a fresh key per [wrap].
  *  4. Map biometric outcomes precisely (only `KeyPermanentlyInvalidated` →
  *     [KeystoreFailure.KeyInvalidated]; lockout/timeout/cancel are transient).
- *  5. Scrub plaintext `ByteArray`s; never put secret/message into a thrown error.
+ *  5. Scrub [wrap]'s plaintext `ByteArray` input on every path; never put a
+ *     secret/message into a thrown error. ([unwrap]'s output is the recovered
+ *     plaintext and is the unavoidable residual returned across the FFI — it
+ *     cannot be scrubbed here because the caller must receive it.)
  *
  * @param requireAuth per-use biometric/credential auth (production: `true`). The
  *   instrumented AAD/tamper tests pass `false` so the crypto-binding controls
@@ -53,8 +56,11 @@ class KeystoreBridgeImpl(
     private val keyStore: KeyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
 
     override fun wrap(alias: String, slotTag: UByte, material: ByteArray): WrapOutput {
-        generateKey(alias)
+        // generateKey is INSIDE the try so the `finally` scrub of `material`
+        // always runs — even if key generation itself throws (obligation 5).
+        // deleteEntry on a not-yet-generated alias is a safe no-op.
         try {
+            generateKey(alias)
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(Cipher.ENCRYPT_MODE, secretKey(alias))
             cipher.updateAAD(byteArrayOf(slotTag.toByte())) // obligation 1 (encrypt)
@@ -66,7 +72,7 @@ class KeystoreBridgeImpl(
             runCatching { keyStore.deleteEntry(alias) } // obligation 2
             throw t.asKeystoreFailure()
         } finally {
-            material.fill(0) // obligation 5
+            material.fill(0) // obligation 5 — runs on every path, incl. keygen failure
         }
     }
 
@@ -82,6 +88,9 @@ class KeystoreBridgeImpl(
             cipher.updateAAD(byteArrayOf(slotTag.toByte())) // obligation 1 (decrypt)
             authenticate(cipher)
             // A wrong slot (AAD) or a tampered blob fails the GCM tag here.
+            // The returned plaintext (K_hsm / TOTP seed) is the accepted,
+            // unavoidable residual: it must cross the FFI back to the core, so it
+            // cannot be scrubbed here. (wrap's INPUT is correctly scrubbed.)
             return cipher.doFinal(ciphertext)
         } catch (t: Throwable) {
             throw t.asKeystoreFailure()
@@ -146,29 +155,34 @@ class KeystoreBridgeImpl(
 
     @Suppress("DEPRECATION")
     private fun securityLevelOf(alias: String): SecurityLevel {
-        return try {
+        // A KeyInfo read failure is NOT evidence of a software key. Failing open
+        // to SOFTWARE here would make a genuine TEE/StrongBox key look insecure,
+        // and the core would then wrongly refuse it. So distinguish the two:
+        // throw a backend fault on a read error, and report SOFTWARE only when
+        // the device genuinely reports a software-backed key.
+        val info = try {
             val key = secretKey(alias)
             val factory = SecretKeyFactory.getInstance(key.algorithm, ANDROID_KEYSTORE)
-            val info = factory.getKeySpec(key, KeyInfo::class.java) as KeyInfo
-            when {
-                android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S ->
-                    when (info.securityLevel) {
-                        KeyProperties.SECURITY_LEVEL_STRONGBOX -> SecurityLevel.STRONG_BOX
-                        KeyProperties.SECURITY_LEVEL_SOFTWARE,
-                        KeyProperties.SECURITY_LEVEL_UNKNOWN_SECURE,
-                        KeyProperties.SECURITY_LEVEL_UNKNOWN,
-                        -> if (info.isInsideSecureHardware) {
-                            SecurityLevel.TRUSTED_ENVIRONMENT
-                        } else {
-                            SecurityLevel.SOFTWARE
-                        }
-                        else -> SecurityLevel.TRUSTED_ENVIRONMENT
-                    }
-                info.isInsideSecureHardware -> SecurityLevel.TRUSTED_ENVIRONMENT
-                else -> SecurityLevel.SOFTWARE
-            }
+            factory.getKeySpec(key, KeyInfo::class.java) as KeyInfo
         } catch (_: Throwable) {
-            SecurityLevel.SOFTWARE
+            throw KeystoreFailure.Backend()
+        }
+        return when {
+            android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S ->
+                when (info.securityLevel) {
+                    KeyProperties.SECURITY_LEVEL_STRONGBOX -> SecurityLevel.STRONG_BOX
+                    KeyProperties.SECURITY_LEVEL_SOFTWARE,
+                    KeyProperties.SECURITY_LEVEL_UNKNOWN_SECURE,
+                    KeyProperties.SECURITY_LEVEL_UNKNOWN,
+                    -> if (info.isInsideSecureHardware) {
+                        SecurityLevel.TRUSTED_ENVIRONMENT
+                    } else {
+                        SecurityLevel.SOFTWARE
+                    }
+                    else -> SecurityLevel.TRUSTED_ENVIRONMENT
+                }
+            info.isInsideSecureHardware -> SecurityLevel.TRUSTED_ENVIRONMENT
+            else -> SecurityLevel.SOFTWARE
         }
     }
 

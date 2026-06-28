@@ -27,6 +27,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -80,21 +81,33 @@ private fun PassmanRoot(activity: FragmentActivity) {
     val vaultFile = remember { File(activity.filesDir, "vault.pmv") }
     // Defense-in-depth: never crash the whole app if opening the vault fails.
     // `open` can return AppError.Setup (e.g. the lockfile cannot be created);
-    // surface it on a screen instead of letting the exception escape remember{}
-    // and kill composition.
-    val appResult = remember {
-        runCatching {
-            PassmanApp.open(
-                vaultFile.absolutePath,
-                KeystoreBridgeImpl(activity.applicationContext, requireAuth = true) { activity },
-                ClipboardBridgeImpl(activity.applicationContext),
-                factOverwrite = true,
-            )
+    // surface it on a screen instead of letting the exception escape and kill
+    // composition.
+    //
+    // open() does disk I/O (vault read + single-instance lockfile), so it must
+    // not run on the main thread during first composition. produceState emits
+    // null while the work runs on Dispatchers.IO, then a Result once it
+    // completes; first composition shows a loading screen instead of blocking.
+    val appResult by produceState<Result<PassmanApp>?>(initialValue = null) {
+        value = withContext(Dispatchers.IO) {
+            runCatching {
+                PassmanApp.open(
+                    vaultFile.absolutePath,
+                    KeystoreBridgeImpl(activity.applicationContext, requireAuth = true) { activity },
+                    ClipboardBridgeImpl(activity.applicationContext),
+                    factOverwrite = true,
+                )
+            }
         }
     }
-    val app = appResult.getOrNull()
+    val result = appResult
+    if (result == null) {
+        LoadingScreen()
+        return
+    }
+    val app = result.getOrNull()
     if (app == null) {
-        StartupErrorScreen(appResult.exceptionOrNull()?.message ?: "Could not open passman.")
+        StartupErrorScreen(result.exceptionOrNull()?.message ?: "Could not open passman.")
         return
     }
 
@@ -114,7 +127,11 @@ private fun PassmanRoot(activity: FragmentActivity) {
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_STOP) {
-                runCatching { app.lock() }
+                // Drop the keys off the main thread: never block/ANR the main
+                // thread on a PassmanApp FFI call inside a lifecycle callback.
+                // lock() is fire-and-forget on the core side; the Compose state
+                // resets below stay on the main thread.
+                scope.launch(Dispatchers.Default) { runCatching { app.lock() } }
                 clearJob.value?.cancel()
                 clearJob.value = null
                 entries = listOf()
@@ -142,7 +159,7 @@ private fun PassmanRoot(activity: FragmentActivity) {
             screen = Screen.GATE
             status = "Session locked — unlock again."
         } catch (t: Throwable) {
-            status = t.message ?: "Error"
+            status = friendlyError(t)
         } finally {
             inFlight = false
         }
@@ -153,9 +170,11 @@ private fun PassmanRoot(activity: FragmentActivity) {
             vaultExists = vaultFile.exists(),
             status = status,
             inFlight = inFlight,
-            onCreate = { master ->
+            onCreate = { master, kdf ->
                 run("Deriving the vault key — this is deliberately slow…") {
-                    val uri = app.createVault(master, KdfChoice.MEDIUM)
+                    // KDF hardness is chosen in GateScreen and defaults to LOW
+                    // (see the rationale there).
+                    val uri = app.createVault(master, kdf)
                     entries = app.list()
                     revealed = uri
                     screen = Screen.VAULT
@@ -222,15 +241,59 @@ private fun StartupErrorScreen(message: String) {
 }
 
 @Composable
+private fun LoadingScreen() {
+    Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text("passman", style = MaterialTheme.typography.headlineMedium)
+        CircularProgressIndicator()
+        Text("Opening your vault…")
+    }
+}
+
+/**
+ * Map a core error to a friendly, actionable line (mirrors the CLI taxonomy:
+ * bad credentials, locked out, already running, no hardware). The core already
+ * returns user-facing detail strings; this normalizes them and, crucially,
+ * replaces the bare technical fallback so the user never sees a raw "Error".
+ */
+private fun friendlyError(t: Throwable): String = when (t) {
+    is AppException.SessionLocked -> "Session locked — unlock again."
+    is AppException.Failed -> friendlyDetail(t.detail)
+    is AppException.Setup -> friendlyDetail(t.detail)
+    else -> t.message ?: "Something went wrong. Please try again."
+}
+
+private fun friendlyDetail(detail: String): String {
+    val d = detail.lowercase()
+    return when {
+        "another" in d || "already" in d || "in use" in d ->
+            "passman is already open for this vault elsewhere."
+        "locked out" in d || "try again in" in d -> detail // carries the remaining-time hint
+        "incorrect" in d || "credential" in d || "totp" in d ->
+            "Incorrect master password or TOTP code."
+        "hardware" in d || "key store" in d ->
+            "This device has no usable secure hardware key store."
+        else -> detail.removePrefix("could not open the vault: ")
+            .replaceFirstChar { it.uppercaseChar() }
+    }
+}
+
+@Composable
 private fun GateScreen(
     vaultExists: Boolean,
     status: String,
     inFlight: Boolean,
-    onCreate: (String) -> Unit,
+    onCreate: (String, KdfChoice) -> Unit,
     onUnlock: (String, String) -> Unit,
 ) {
     var master by remember { mutableStateOf("") }
+    var confirm by remember { mutableStateOf("") }
     var code by remember { mutableStateOf("") }
+    // Default to LOW (256 MiB Argon2). MEDIUM's 1 GiB working set risks the
+    // lowmemorykiller / OOM on phones, and the Keystore-bound second factor
+    // already gates offline guessing — so a lighter KDF is an acceptable
+    // trade-off here. The user can still opt up to MEDIUM.
+    var kdf by remember { mutableStateOf(KdfChoice.LOW) }
+
     Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("passman", style = MaterialTheme.typography.headlineMedium)
         OutlinedTextField(
@@ -249,11 +312,43 @@ private fun GateScreen(
             )
             Button({ onUnlock(master, code) }, Modifier.fillMaxWidth(), enabled = !inFlight) { Text("Unlock") }
         } else {
-            Text("No vault yet — create one.")
-            Button({ onCreate(master) }, Modifier.fillMaxWidth(), enabled = !inFlight) { Text("Create vault") }
+            OutlinedTextField(
+                confirm, { confirm = it }, label = { Text("Confirm master password") },
+                visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(),
+            )
+            // Local-only guards (no UniFFI strength surface): the two fields must
+            // match, and we warn under 12 characters. A real strength estimate is
+            // deferred to a separate core/UniFFI pass.
+            val mismatch = confirm.isNotEmpty() && master != confirm
+            val tooShort = master.isNotEmpty() && master.length < 12
+            when {
+                mismatch -> Text("Passwords don't match.")
+                tooShort -> Text("Use at least 12 characters for your master password.")
+                else -> Text("No vault yet — create one.")
+            }
+            Text("Key hardness", style = MaterialTheme.typography.labelLarge)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                KdfOption("Low (recommended)", kdf == KdfChoice.LOW) { kdf = KdfChoice.LOW }
+                KdfOption("Medium", kdf == KdfChoice.MEDIUM) { kdf = KdfChoice.MEDIUM }
+            }
+            Button(
+                { onCreate(master, kdf) },
+                Modifier.fillMaxWidth(),
+                enabled = !inFlight && master.length >= 12 && master == confirm,
+            ) { Text("Create vault") }
         }
         if (inFlight) CircularProgressIndicator()
         if (status.isNotEmpty()) Text(status)
+    }
+}
+
+/** A single KDF-hardness choice: filled when selected, text-only otherwise. */
+@Composable
+private fun KdfOption(label: String, selected: Boolean, onClick: () -> Unit) {
+    if (selected) {
+        Button(onClick) { Text(label) }
+    } else {
+        TextButton(onClick) { Text(label) }
     }
 }
 
