@@ -8,7 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::rc::Rc;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,25 +40,44 @@ const REVEAL_HIDE_SECS: u32 = 10;
 const CLIPBOARD_CLEAR_SECS: u32 = 30;
 
 /// Parsed command-line options (a tiny manual parse so GTK does not see them).
+#[derive(Debug, PartialEq, Eq)]
 struct Opts {
     allow_software: bool,
     vault_dir: Option<PathBuf>,
 }
 
-fn parse_args() -> Opts {
+/// Parse our options from an argument iterator (the program name already
+/// stripped). Pure, so it can be unit-tested without touching the environment.
+///
+/// # Errors
+///
+/// Returns an error if `--vault-dir` is given without a following path value.
+/// An unrecognized argument is warned about on stderr and otherwise ignored.
+fn parse_opts<I>(mut args: I) -> anyhow::Result<Opts>
+where
+    I: Iterator<Item = String>,
+{
     let mut opts = Opts {
         allow_software: false,
         vault_dir: None,
     };
-    let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--allow-software-hsm" => opts.allow_software = true,
-            "--vault-dir" => opts.vault_dir = args.next().map(PathBuf::from),
-            _ => {}
+            "--vault-dir" => {
+                let dir = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--vault-dir requires a directory path"))?;
+                opts.vault_dir = Some(PathBuf::from(dir));
+            }
+            other => eprintln!("warning: ignoring unrecognized argument '{other}'"),
         }
     }
-    opts
+    Ok(opts)
+}
+
+fn parse_args() -> anyhow::Result<Opts> {
+    parse_opts(std::env::args().skip(1))
 }
 
 fn resolve_paths(opts: &Opts) -> anyhow::Result<Paths> {
@@ -75,10 +94,13 @@ fn resolve_paths(opts: &Opts) -> anyhow::Result<Paths> {
 /// Returns an error before GTK starts if paths, settings, the backend, or the
 /// single-instance lock cannot be set up.
 pub fn run() -> anyhow::Result<ExitCode> {
-    let opts = parse_args();
+    let opts = parse_args()?;
     let paths = resolve_paths(&opts)?;
     let settings = Settings::load(paths.settings())?;
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    // Share the session clock with the clipboard so cookie timestamps and the
+    // rest of the app read from one time source (finding S-info / §10).
+    let clip_clock = Arc::clone(&clock);
 
     let backend = select_linux_backend(opts.allow_software).map_err(|e| match e {
         passman_hsm::HsmError::HardwareAbsent => anyhow::anyhow!(
@@ -98,7 +120,7 @@ pub fn run() -> anyhow::Result<ExitCode> {
     let fact_overwrite = settings.clipboard_fact_overwrite;
     let (session, responses) = Session::spawn(
         app_core,
-        || Ok(SystemClipboard::new()),
+        move || Ok(SystemClipboard::new(clip_clock)),
         Box::new(crate::DesktopPrompter),
         fact_overwrite,
     );
@@ -214,9 +236,20 @@ struct Ui {
     /// Label stored at the moment the user clicks Add or Remove, consumed when
     /// the next `Response::Entries` arrives (finding UX-medium / §5 item 6).
     pending_mutation: RefCell<Option<PendingMutation>>,
+    /// Vault row-action buttons (Reveal / Copy×2 / Remove). Kept insensitive
+    /// until a row is selected so they cannot silently no-op
+    /// (finding UX-low / §5 item 6).
+    action_buttons: Vec<gtk::Button>,
 }
 
 impl Ui {
+    /// Enable or disable all row-action buttons together.
+    fn set_actions_enabled(&self, enabled: bool) {
+        for button in &self.action_buttons {
+            button.set_sensitive(enabled);
+        }
+    }
+
     /// The id of the currently-selected entry, if any.
     fn selected_id(&self) -> Option<EntryId> {
         let idx = (*self.selected.borrow())?;
@@ -267,6 +300,9 @@ impl Ui {
         *self.entries.borrow_mut() = entries;
         *self.selected.borrow_mut() = None;
         self.reveal.set_text(OBSCURED);
+        // Selection was just cleared; row actions have nothing to act on
+        // (finding UX-low / §5 item 6).
+        self.set_actions_enabled(false);
     }
 }
 
@@ -288,6 +324,27 @@ fn tier_needs_warning(tier: StrengthTier) -> bool {
     !matches!(tier, StrengthTier::Strong | StrengthTier::Excellent)
 }
 
+/// Outcome of validating the create-vault form's two password fields.
+#[derive(Debug, PartialEq, Eq)]
+enum CreateForm {
+    Ok,
+    Empty,
+    Mismatch,
+}
+
+/// Validate the create-vault password and its confirmation (finding UX-medium / §5 item 3).
+///
+/// Pure helper extracted so the branching can be unit-tested without GTK.
+fn validate_create_form(master: &str, confirm: &str) -> CreateForm {
+    if master.is_empty() {
+        CreateForm::Empty
+    } else if master != confirm {
+        CreateForm::Mismatch
+    } else {
+        CreateForm::Ok
+    }
+}
+
 /// Build the window and all wiring.
 #[allow(clippy::too_many_lines)] // cohesive widget construction; splitting hurts clarity
 fn build_ui(
@@ -305,12 +362,16 @@ fn build_ui(
         .show_peek_icon(true)
         .placeholder_text("Master password")
         .build();
+    // Accessible names so screen readers do not rely on placeholder text alone
+    // (finding a11y-low / §5 item 7).
+    master.update_property(&[gtk::accessible::Property::Label("Master password")]);
     // Second entry for confirm (only shown on create, hidden on unlock).
     let create_confirm = gtk::PasswordEntry::builder()
         .show_peek_icon(true)
         .placeholder_text("Confirm master password")
         .visible(!vault_exists)
         .build();
+    create_confirm.update_property(&[gtk::accessible::Property::Label("Confirm master password")]);
     // Non-blocking strength label (only shown on create).
     let create_strength = gtk::Label::builder()
         .label("")
@@ -321,16 +382,21 @@ fn build_ui(
         .placeholder_text("TOTP code")
         .max_length(8)
         .build();
+    totp.update_property(&[gtk::accessible::Property::Label("TOTP code")]);
     let unlock_btn = gtk::Button::with_label("Unlock");
     unlock_btn.add_css_class("suggested-action");
     let create_btn = gtk::Button::with_label("Create vault");
     create_btn.add_css_class("suggested-action");
     let unlock_spinner = gtk::Spinner::new();
-    let unlock_error = gtk::Label::builder()
-        .label("")
-        .wrap(true)
-        .css_classes(["error"])
+    // Built via the generic object builder so we can set the construct-only
+    // `accessible-role`: an Alert (assertive live) region so a screen reader
+    // announces unlock/create failures (finding a11y-low / §5 item 7).
+    let unlock_error: gtk::Label = glib::Object::builder()
+        .property("label", "")
+        .property("wrap", true)
+        .property("accessible-role", gtk::AccessibleRole::Alert.to_value())
         .build();
+    unlock_error.add_css_class("error");
     let unlock_hint = gtk::Label::new(Some(if vault_exists {
         "Unlock your vault."
     } else {
@@ -368,11 +434,23 @@ fn build_ui(
         .vexpand(true)
         .child(&list)
         .build();
+    // SECURITY (accepted residual): GTK has no zeroizing label/entry, so a
+    // revealed secret and the seed-bearing TOTP provisioning URI linger in this
+    // GtkLabel's buffer until overwritten. We minimise dwell: the label is reset
+    // to OBSCURED on row selection (wire_list_selection), on list rebuild
+    // (set_entries), on navigation away from the vault page (add_btn), and via
+    // the 10 s auto-hide timer (finding S-low / §5 item 8).
     let reveal = gtk::Label::builder()
         .label(OBSCURED)
         .selectable(true)
         .build();
-    let status = gtk::Label::builder().label("").wrap(true).build();
+    // Status (polite live) region so a screen reader announces success/error
+    // text changes (finding a11y-low / §5 item 7).
+    let status: gtk::Label = glib::Object::builder()
+        .property("label", "")
+        .property("wrap", true)
+        .property("accessible-role", gtk::AccessibleRole::Status.to_value())
+        .build();
 
     let reveal_btn = gtk::Button::with_label("Reveal");
     let copy_pw_btn = gtk::Button::with_label("Copy password");
@@ -407,18 +485,23 @@ fn build_ui(
 
     // --- Add page ---
     let add_label = gtk::Entry::builder().placeholder_text("Label").build();
+    add_label.update_property(&[gtk::accessible::Property::Label("Entry label")]);
     let add_user = gtk::Entry::builder().placeholder_text("Username").build();
+    add_user.update_property(&[gtk::accessible::Property::Label("Username")]);
     let add_pass = gtk::PasswordEntry::builder()
         .show_peek_icon(true)
         .placeholder_text("Password")
         .build();
+    add_pass.update_property(&[gtk::accessible::Property::Label("Password")]);
     let gen_btn = gtk::Button::with_label("Generate");
     let add_url = gtk::Entry::builder()
         .placeholder_text("URL (optional)")
         .build();
+    add_url.update_property(&[gtk::accessible::Property::Label("URL (optional)")]);
     let add_notes = gtk::Entry::builder()
         .placeholder_text("Notes (optional)")
         .build();
+    add_notes.update_property(&[gtk::accessible::Property::Label("Notes (optional)")]);
     let save_btn = gtk::Button::with_label("Save");
     save_btn.add_css_class("suggested-action");
     let cancel_btn = gtk::Button::with_label("Cancel");
@@ -479,6 +562,13 @@ fn build_ui(
         selected: RefCell::new(None),
         user_initiated_lock: Cell::new(false),
         pending_mutation: RefCell::new(None),
+        // gtk widget `.clone()` is a GObject ref-count bump, not a deep copy.
+        action_buttons: vec![
+            reveal_btn.clone(),
+            copy_pw_btn.clone(),
+            copy_user_btn.clone(),
+            remove_btn.clone(),
+        ],
     });
 
     wire_unlock(&ui, &unlock_btn);
@@ -494,9 +584,16 @@ fn build_ui(
         &add_btn,
     );
     wire_add_page(&ui, &gen_btn, &save_btn, &cancel_btn);
+    wire_enter_submit(&ui);
     attach_response_poll(&ui, responses);
 
+    // Row actions start disabled until a row is selected (finding UX-low / §5 item 6).
+    ui.set_actions_enabled(false);
+
     window.present();
+    // Focus the master entry so the user can start typing immediately
+    // (finding UX-medium / §5 item 3).
+    ui.master.grab_focus();
 }
 
 fn wire_unlock(ui: &Rc<Ui>, unlock_btn: &gtk::Button) {
@@ -544,16 +641,19 @@ fn wire_create(ui: &Rc<Ui>, create_btn: &gtk::Button, create_confirm: &gtk::Pass
         let create_confirm = create_confirm.clone();
         create_btn.connect_clicked(move |_| {
             let master = SecretString::new(ui.master.text().to_string());
-            if master.expose().is_empty() {
-                ui.unlock_error.set_text("Choose a master password first.");
-                return;
-            }
-            // Confirm must match (finding UX-medium / §5 item 3).
             let confirm = create_confirm.text();
-            if master.expose() != confirm.as_str() {
-                ui.unlock_error
-                    .set_text("The passwords do not match — re-enter both.");
-                return;
+            // Master must be non-empty and match its confirmation (finding UX-medium / §5 item 3).
+            match validate_create_form(master.expose(), confirm.as_str()) {
+                CreateForm::Empty => {
+                    ui.unlock_error.set_text("Choose a master password first.");
+                    return;
+                }
+                CreateForm::Mismatch => {
+                    ui.unlock_error
+                        .set_text("The passwords do not match — re-enter both.");
+                    return;
+                }
+                CreateForm::Ok => {}
             }
             // Non-blocking weakness warning: warn but do not block creation
             // (mirrors CLI behaviour in commands.rs `warn_if_weak`).
@@ -580,6 +680,8 @@ fn wire_list_selection(ui: &Rc<Ui>, list: &gtk::ListBox) {
     let ui = Rc::clone(ui);
     list.connect_row_selected(move |_, row| {
         *ui.selected.borrow_mut() = row.map(|r| usize::try_from(r.index()).unwrap_or(0));
+        // Row actions are usable only with a selection (finding UX-low / §5 item 6).
+        ui.set_actions_enabled(row.is_some());
         ui.reveal.set_text(OBSCURED);
         ui.status.set_text("");
     });
@@ -653,6 +755,9 @@ fn wire_vault_actions(
         let ui = Rc::clone(ui);
         add_btn.connect_clicked(move |_| {
             clear_add_form(&ui);
+            // Clear any revealed secret before leaving the vault page so it does
+            // not linger in the label behind another page (finding S-low / §5 item 8).
+            ui.reveal.set_text(OBSCURED);
             ui.stack.set_visible_child_name("add");
         });
     }
@@ -674,8 +779,15 @@ fn wire_add_page(
                 Charset::default_vault(),
                 RequiredClasses::one_of_each(),
             );
-            if let Ok(pw) = generate(&req) {
-                ui.add_pass.set_text(pw.expose());
+            match generate(&req) {
+                Ok(pw) => ui.add_pass.set_text(pw.expose()),
+                // generate only errors on an impossible request (length below the
+                // required-class minimums, or an empty charset); the fixed
+                // default_vault/one_of_each request cannot hit that, but surface
+                // the Err rather than swallow it.
+                Err(e) => ui
+                    .status
+                    .set_text(&format!("Could not generate a password: {e}")),
             }
         });
     }
@@ -697,6 +809,9 @@ fn wire_add_page(
                 url: SecretString::new(ui.add_url.text().to_string()),
                 notes: SecretString::new(ui.add_notes.text().to_string()),
             });
+            // The plaintext is now copied into the SecretStrings above; wipe it
+            // out of the GtkEntry/PasswordEntry buffers (finding S-medium / §5 item 1).
+            clear_add_form(&ui);
             ui.stack.set_visible_child_name("vault");
         });
     }
@@ -706,6 +821,40 @@ fn wire_add_page(
             clear_add_form(&ui);
             ui.stack.set_visible_child_name("vault");
         });
+    }
+}
+
+/// Submit the visible unlock-page form when the user presses Enter in any of its
+/// entries (finding UX-medium / §5 item 3).
+///
+/// `create_btn` and `unlock_btn` are mutually exclusive (see [`Ui::refresh_gate`]),
+/// so we fire whichever the gate currently shows. Connecting the per-entry
+/// `activate` signals avoids having to swap the window's default widget when the
+/// create-vs-unlock gate flips.
+fn wire_enter_submit(ui: &Rc<Ui>) {
+    fn submit(ui: &Ui) {
+        if ui.create_btn.is_visible() {
+            ui.create_btn.emit_clicked();
+        } else {
+            ui.unlock_btn.emit_clicked();
+        }
+    }
+    // Clone the widget handle out first (a GObject ref bump) so the closure can
+    // move the `Rc<Ui>` without conflicting with the receiver borrow.
+    {
+        let ui = Rc::clone(ui);
+        let master = ui.master.clone();
+        master.connect_activate(move |_| submit(&ui));
+    }
+    {
+        let ui = Rc::clone(ui);
+        let confirm = ui.create_confirm.clone();
+        confirm.connect_activate(move |_| submit(&ui));
+    }
+    {
+        let ui = Rc::clone(ui);
+        let totp = ui.totp.clone();
+        totp.connect_activate(move |_| submit(&ui));
     }
 }
 
@@ -722,10 +871,25 @@ fn clear_add_form(ui: &Rc<Ui>) {
 fn attach_response_poll(ui: &Rc<Ui>, responses: Receiver<Response>) {
     let ui = Rc::clone(ui);
     glib::timeout_add_local(Duration::from_millis(50), move || {
-        while let Ok(response) = responses.try_recv() {
-            handle_response(&ui, response);
+        // Drain everything currently available, then decide whether to keep the
+        // timer alive based on the channel state (finding UX-medium / §5 item 2).
+        loop {
+            match responses.try_recv() {
+                Ok(response) => handle_response(&ui, response),
+                Err(TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                Err(TryRecvError::Disconnected) => {
+                    // The worker thread has exited/panicked; polling a dead
+                    // channel forever would make every button silently no-op and
+                    // look frozen. Surface it on both status surfaces (whichever
+                    // page is showing) and stop the timer.
+                    let msg = "The background worker stopped unexpectedly. \
+                               Please restart passman.";
+                    ui.unlock_error.set_text(msg);
+                    ui.status.set_text(msg);
+                    return glib::ControlFlow::Break;
+                }
+            }
         }
-        glib::ControlFlow::Continue
     });
 }
 
@@ -747,7 +911,7 @@ fn handle_response(ui: &Rc<Ui>, response: Response) {
             ui.reveal.set_text(provisioning_uri.expose());
             ui.status.set_text(
                 "Vault created. Scan this TOTP URI in your authenticator now — \
-                 it hides automatically in 10 s. Click \"Done\" when saved.",
+                 it will hide automatically in 10 s.",
             );
             ui.stack.set_visible_child_name("vault");
             // Start the auto-hide timer (mirrors the Revealed handler, §5.4).
@@ -845,7 +1009,71 @@ fn handle_response(ui: &Rc<Ui>, response: Response) {
 
 #[cfg(test)]
 mod tests {
-    use super::{tier_label, tier_needs_warning, StrengthTier};
+    use std::path::PathBuf;
+
+    use super::{
+        parse_opts, tier_label, tier_needs_warning, validate_create_form, CreateForm, StrengthTier,
+    };
+
+    /// Build an owned-`String` arg iterator (program name already stripped).
+    fn args(items: &[&str]) -> std::vec::IntoIter<String> {
+        items
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    #[test]
+    fn parse_opts_defaults_to_hardware_and_no_dir() {
+        let opts = parse_opts(args(&[])).expect("empty args parse");
+        assert!(!opts.allow_software);
+        assert_eq!(opts.vault_dir, None);
+    }
+
+    #[test]
+    fn parse_opts_sets_allow_software_flag() {
+        let opts = parse_opts(args(&["--allow-software-hsm"])).expect("parse");
+        assert!(opts.allow_software);
+        assert_eq!(opts.vault_dir, None);
+    }
+
+    #[test]
+    fn parse_opts_reads_vault_dir_value() {
+        let opts = parse_opts(args(&["--vault-dir", "/tmp/passman-x"])).expect("parse");
+        assert_eq!(opts.vault_dir, Some(PathBuf::from("/tmp/passman-x")));
+    }
+
+    #[test]
+    fn parse_opts_errors_when_vault_dir_value_missing() {
+        let err = parse_opts(args(&["--vault-dir"])).expect_err("missing value should error");
+        assert!(
+            err.to_string().contains("--vault-dir"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_opts_ignores_unknown_flag() {
+        // Unknown flags warn on stderr but must not fail the parse.
+        let opts = parse_opts(args(&["--bogus", "--allow-software-hsm"])).expect("parse");
+        assert!(opts.allow_software);
+        assert_eq!(opts.vault_dir, None);
+    }
+
+    #[test]
+    fn validate_create_form_flags_empty_and_mismatch() {
+        assert_eq!(validate_create_form("", ""), CreateForm::Empty);
+        assert_eq!(validate_create_form("", "anything"), CreateForm::Empty);
+        assert_eq!(
+            validate_create_form("a-strong-pass", "typo"),
+            CreateForm::Mismatch
+        );
+        assert_eq!(
+            validate_create_form("a-strong-pass", "a-strong-pass"),
+            CreateForm::Ok
+        );
+    }
 
     #[test]
     fn tier_label_covers_all_variants() {
