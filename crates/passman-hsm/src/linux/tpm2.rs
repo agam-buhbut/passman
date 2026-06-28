@@ -29,6 +29,28 @@
 //!   `max_attempts_before_lockout = None`; a future PIN would flip that to
 //!   `Some(..)`.
 //!
+//! # Bus confidentiality (null session — accepted residual)
+//!
+//! Both the seal (`create` in [`enroll`](Tpm2KeyStore::enroll)) and the unseal
+//! (in [`complete_unwrap`](Tpm2KeyStore::complete_unwrap)) run under
+//! `execute_with_nullauth_session`, i.e. a **NULL (unsalted, non-encrypting)**
+//! session. A NULL session neither salts the session key nor sets the
+//! `TPMA_SESSION` decrypt/encrypt attributes, so the sensitive `create`
+//! parameter (the `slot_tag ‖ secret` being sealed) and the `unseal` response
+//! (that same secret) cross the TPM command bus **in cleartext**. An attacker
+//! who can *passively* sniff the physical bus (LPC/SPI/I²C between CPU and TPM)
+//! could therefore recover the slot secret. This is an **accepted residual**:
+//! the threat model's primary adversary does not have physical bus access, and
+//! an attacker who does already has stronger avenues against a powered device.
+//!
+//! Upgrade path (deferred — needs real-hardware validation): replace the NULL
+//! session with a **salted, SRK-bound HMAC session** that carries
+//! `TPMA_SESSION` *decrypt* on the sensitive-data `create` parameter and
+//! *encrypt* on the `unseal` response. Those attributes encrypt the sensitive
+//! parameters to a session key derived against the TPM (the salt is sealed to
+//! the SRK), closing the passive-sniff gap without any change to the on-disk
+//! blob format.
+//!
 //! # `PlatformCtx`
 //!
 //! `()` — the backend opens its own [`Context`] per operation (an approved §6.5
@@ -188,6 +210,8 @@ impl HardwareKeyStore for Tpm2KeyStore {
 
         // `move` so the (single-use) closure takes ownership of `sealed_public`
         // and `sensitive` — no clone of the sensitive material is made.
+        // NULL session: the sensitive `create` parameter is not bus-encrypted —
+        // see "Bus confidentiality" in the module docs (accepted residual).
         let create_result: CreateKeyResult = context
             .execute_with_nullauth_session(move |ctx| {
                 let srk = ensure_srk(ctx)?;
@@ -250,6 +274,8 @@ impl HardwareKeyStore for Tpm2KeyStore {
         // secret on its own — the private blob is encrypted to the TPM). The
         // closure returns the unsealed `slot_tag ‖ secret`; the slot check is
         // done outside so it surfaces as an `HsmError`, not a `tss_esapi::Error`.
+        // NULL session: the `unseal` response is not bus-encrypted — see "Bus
+        // confidentiality" in the module docs (accepted residual).
         let sealed: SecretBytes = context
             .execute_with_nullauth_session(move |ctx| {
                 let srk = ensure_srk(ctx)?;

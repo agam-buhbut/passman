@@ -50,19 +50,22 @@ impl UnwrapHandle {
 
     /// Consume the handle for the mock backend, recovering its state.
     ///
-    /// Stays infallible (returning [`crate::mock::MockUnwrapState`]) so the mock
-    /// module — which this task must not modify — keeps compiling unchanged.
+    /// A mock-minted handle only ever holds the `Mock` variant: an
+    /// [`UnwrapHandle`] is single-use and is consumed by the same backend that
+    /// minted it (a caller pairs `begin_unwrap` and `complete_unwrap` on one
+    /// store). The catch-all therefore guards against a routing *bug*, not normal
+    /// flow — and it **fails closed** with the same
+    /// [`HsmError::MalformedBlob`](crate::error::HsmError::MalformedBlob) the
+    /// sibling `into_*` consumers return, rather than panicking, so a misrouted
+    /// handle never aborts the process. With only `mock` enabled the arm is dead
+    /// and `#[allow(unreachable_patterns)]` silences the redundancy.
     ///
-    /// When a non-mock backend feature is *also* compiled in, `HandleInner` gains
-    /// extra variants and this match needs a catch-all. That arm is genuinely
-    /// unreachable: an [`UnwrapHandle`] is single-use and is always consumed by
-    /// the same backend that minted it (a caller pairs `begin_unwrap` and
-    /// `complete_unwrap` on one store), so a mock-minted handle only ever holds
-    /// the `Mock` variant here. The arm therefore asserts that invariant rather
-    /// than fabricating mock state. With only `mock` enabled the arm is dead and
-    /// `#[allow(unreachable_patterns)]` silences the redundancy.
+    /// # Errors
+    ///
+    /// Returns [`HsmError::MalformedBlob`](crate::error::HsmError::MalformedBlob)
+    /// if the handle was minted by a different backend.
     #[cfg(feature = "mock")]
-    pub(crate) fn into_mock(self) -> crate::mock::MockUnwrapState {
+    pub(crate) fn into_mock(self) -> Result<crate::mock::MockUnwrapState, crate::error::HsmError> {
         // The catch-all is intentional: the *other* `HandleInner` variants are
         // cfg-gated and the set present depends on the feature combination, so
         // they cannot be named statically here — hence
@@ -70,8 +73,10 @@ impl UnwrapHandle {
         // covers the mock-only build where the wildcard is redundant.
         #[allow(unreachable_patterns, clippy::match_wildcard_for_single_variants)]
         match self.inner {
-            HandleInner::Mock(state) => state,
-            _ => unreachable!("UnwrapHandle routed to the mock backend was minted elsewhere"),
+            HandleInner::Mock(state) => Ok(state),
+            _ => Err(crate::error::HsmError::MalformedBlob {
+                reason: "unwrap handle was not minted by the mock backend",
+            }),
         }
     }
 
@@ -181,4 +186,33 @@ enum HandleInner {
     Tpm2(crate::linux::tpm2::Tpm2UnwrapState),
     #[cfg(feature = "android-keystore")]
     Android(crate::android::AndroidUnwrapState),
+}
+
+#[cfg(test)]
+mod tests {
+    // The mis-routing guard in `into_mock` only has another variant to construct
+    // when a second backend feature is compiled in alongside `mock`. Use the
+    // dependency-free `android-keystore` backend to mint a non-mock handle.
+    #[cfg(all(feature = "mock", feature = "android-keystore"))]
+    #[test]
+    fn into_mock_rejects_a_handle_minted_by_another_backend() {
+        use super::UnwrapHandle;
+        use crate::android::AndroidUnwrapState;
+        use crate::error::HsmError;
+
+        // A routing bug that hands an Android-minted handle to the mock consumer
+        // must fail closed (MalformedBlob), not panic via the former unreachable!.
+        let handle = UnwrapHandle::for_android(AndroidUnwrapState {
+            alias: "passman-deadbeef".to_owned(),
+            iv: [0u8; 12],
+            ciphertext: vec![0u8; 16],
+            slot_tag: 0x00,
+        });
+        // `MockUnwrapState` (the Ok type) is not `Debug`, so match rather than
+        // `expect_err`.
+        match handle.into_mock() {
+            Ok(_) => panic!("a non-mock handle must be rejected, not accepted"),
+            Err(e) => assert!(matches!(e, HsmError::MalformedBlob { .. })),
+        }
+    }
 }

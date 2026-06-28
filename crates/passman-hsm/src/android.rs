@@ -260,6 +260,15 @@ impl HardwareKeyStore for AndroidKeyStore {
         // (see `security_level`) rather than propagating an error.
         let level = self.security_level();
         HsmCapabilities {
+            // Semantics: the wrapping key is *user-auth gated* (`Keystore` keys
+            // are minted `setUserAuthenticationRequired(true)`, so use requires a
+            // device-credential or biometric unlock). This is **not** a guarantee
+            // that a biometric is currently enrolled — the gate may be satisfied
+            // by the device PIN/pattern/password. Callers must treat it as "an
+            // auth prompt gates the key", not "fingerprint/face is available", and
+            // must not over-trust it as proof of biometric enrollment. We report
+            // `true` unconditionally rather than probing enrollment (no new
+            // Android probing here).
             biometric_supported: true,
             strongbox_backed: matches!(level, KeystoreSecurityLevel::StrongBox),
             pcr_bound: false,
@@ -282,6 +291,16 @@ impl HardwareKeyStore for AndroidKeyStore {
         _ctx: &Self::PlatformCtx,
         _prompter: &dyn BiometricPrompter,
     ) -> Result<WrappedBlob, HsmError> {
+        // Refuse-software pre-flight (§6.2): probe the device posture *before*
+        // minting a key or prompting the user, so a software-only device is
+        // rejected without a wasted keygen and biometric prompt. `security_level`
+        // is memoized and falls back to `Software` on a probe failure (fail
+        // closed). The post-wrap `wrapped.level` check below stays as the
+        // authoritative belt-and-suspenders — `wrap` reports the key's real level.
+        if matches!(self.security_level(), KeystoreSecurityLevel::Software) {
+            return Err(HsmError::HardwareAbsent);
+        }
+
         // `_prompter` is unused on Android (decision D-A1): a per-use-auth key's
         // `Cipher.doFinal` must run under a `CryptoObject` the prompt authorized,
         // which only the Kotlin shim can wire up — so the shim drives its own
@@ -304,6 +323,17 @@ impl HardwareKeyStore for AndroidKeyStore {
         if matches!(wrapped.level, KeystoreSecurityLevel::Software) {
             let _ = self.wrapper.invalidate(&alias);
             return Err(HsmError::HardwareAbsent);
+        }
+
+        // A real GCM ciphertext always carries the appended 16-byte tag; a
+        // shorter one is a malformed wrap from the shim. Reject it (parity with
+        // `decode_payload`) and delete the just-created key (invariant 6) rather
+        // than durably persisting a blob that can never decrypt.
+        if wrapped.ciphertext.len() < GCM_TAG_LEN {
+            let _ = self.wrapper.invalidate(&alias);
+            return Err(HsmError::Backend(
+                "android wrap produced a ciphertext shorter than the GCM tag".to_owned(),
+            ));
         }
 
         let payload = encode_payload(&alias, &wrapped.iv, &wrapped.ciphertext)?;
@@ -537,6 +567,9 @@ mod tests {
         // When set, `wrap` simulates "key created, then the op failed": it stores
         // the key (so the orchestrator's cleanup is observable) then returns Err.
         fail_wrap: bool,
+        // When set, `wrap` returns Ok but with a ciphertext shorter than the GCM
+        // tag (a malformed wrap), to exercise enroll's length guard.
+        short_ciphertext: bool,
         // When set, `probe` returns an error (for the capabilities fallback test).
         fail_probe: bool,
         // Counts `probe` invocations, so the memoization test can assert
@@ -550,6 +583,7 @@ mod tests {
                 keys: Mutex::new(HashMap::new()),
                 level: KeystoreSecurityLevel::TrustedEnvironment,
                 fail_wrap: false,
+                short_ciphertext: false,
                 fail_probe: false,
                 probe_calls: AtomicUsize::new(0),
             }
@@ -565,6 +599,13 @@ mod tests {
         fn failing_wrap() -> Self {
             Self {
                 fail_wrap: true,
+                ..Self::new()
+            }
+        }
+
+        fn short_ciphertext() -> Self {
+            Self {
+                short_ciphertext: true,
                 ..Self::new()
             }
         }
@@ -613,6 +654,15 @@ mod tests {
                 // Simulate a post-keygen failure: the key now exists (above), so
                 // the orchestrator's invariant-6 cleanup is observable.
                 return Err(KeystoreError::Backend);
+            }
+            if self.short_ciphertext {
+                // Simulate a malformed wrap: a ciphertext shorter than the 16-byte
+                // GCM tag. The key exists (above) so enroll's cleanup is observable.
+                return Ok(WrappedParts {
+                    iv,
+                    ciphertext: vec![0u8; GCM_TAG_LEN - 1],
+                    level: self.level,
+                });
             }
             Ok(WrappedParts {
                 iv,
@@ -925,6 +975,22 @@ mod tests {
             .expect_err("wrap failure must surface");
         assert!(matches!(err, HsmError::Backend(_)));
         assert_eq!(mock.key_count(), 0, "key must be deleted on enroll failure");
+    }
+
+    #[test]
+    fn enroll_rejects_undersized_ciphertext() {
+        // A wrap returning a ciphertext shorter than the 16-byte GCM tag is
+        // malformed; enroll must reject it with `Backend` before persisting a
+        // blob, and delete the just-created key (invariant 6).
+        let mock = Arc::new(MockKeystoreWrapper::short_ciphertext());
+        let store = AndroidKeyStore::new(mock.clone());
+        let prompter = NoopPrompter;
+
+        let err = store
+            .enroll(HsmSlot::VaultKey, &material(), &(), &prompter)
+            .expect_err("undersized ciphertext must be rejected");
+        assert!(matches!(err, HsmError::Backend(_)));
+        assert_eq!(mock.key_count(), 0, "rejected wrap must delete the key");
     }
 
     #[test]

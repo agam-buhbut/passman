@@ -19,6 +19,13 @@ use crate::error::HsmError;
 use crate::slot::HsmKind;
 
 /// The single supported outer blob version (§6.3, §4.10).
+///
+/// This is the **only** version field in the format: the per-backend `payload`
+/// has no inner version byte of its own, so every backend-specific payload
+/// layout is versioned by this *outer* `blob_version`. Consequently it MUST be
+/// bumped whenever **any** backend's payload format changes (and `from_bytes`
+/// taught to accept the old and new layouts), so an old on-disk blob is never
+/// silently misparsed against a newer payload schema.
 const BLOB_VERSION: u8 = 0x00;
 
 /// Bytes of fixed header before the payload: version(1) + kind(1) + len(2).

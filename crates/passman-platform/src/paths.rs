@@ -104,18 +104,28 @@ impl Paths {
     }
 }
 
-/// Create `dir` (and missing parents), then tighten it to owner-only on Unix.
+/// Create `dir` (and missing parents). On Unix the directory is created
+/// owner-only (`0o700`) atomically.
+///
+/// Creating with the mode (rather than create-then-`chmod`) closes the window
+/// where the directory would briefly exist with the default umask permissions,
+/// i.e. potentially group/world-accessible. `recursive(true)` makes this
+/// idempotent on an already-existing dir and applies the mode to the leaf
+/// component it creates.
 fn create_dir_secure(dir: &Path) -> Result<(), PlatformError> {
-    std::fs::create_dir_all(dir).map_err(|e| PlatformError::io("create app directory", e))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        // Best-effort tighten of our own app dir to owner-only. A failure here
-        // (e.g. on a pre-existing dir we do not own) is non-fatal: the vault
-        // file itself is created `0o600` by passman-core regardless.
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(dir)
+            .map_err(|e| PlatformError::io("create app directory", e))
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir).map_err(|e| PlatformError::io("create app directory", e))
+    }
 }
 
 #[cfg(test)]
@@ -163,5 +173,18 @@ mod tests {
         Paths::under_base(&base).ensure_dirs().expect("ensure_dirs");
         let mode = std::fs::metadata(&base).expect("meta").permissions().mode();
         assert_eq!(mode & 0o777, 0o700, "app dir must be owner-only");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_dirs_creates_nested_leaf_owner_only_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        // A leaf whose parent does not yet exist exercises the recursive create;
+        // the newly created leaf must come out owner-only with no chmod window.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().join("outer").join("passman");
+        Paths::under_base(&base).ensure_dirs().expect("ensure_dirs");
+        let mode = std::fs::metadata(&base).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "newly created leaf must be owner-only");
     }
 }

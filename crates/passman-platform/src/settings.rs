@@ -6,7 +6,9 @@
 //! (`deny_unknown_fields`) and missing keys fall back to their documented
 //! defaults (`#[serde(default)]`), so a partial or absent file is still valid.
 
-use std::path::Path;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -81,7 +83,15 @@ impl Settings {
         }
     }
 
-    /// Write settings to `path`, creating the parent directory if needed.
+    /// Write settings to `path` atomically, creating the parent directory if
+    /// needed.
+    ///
+    /// The write is crash-safe: a uniquely-named temp file in the same directory
+    /// is written and `fsync`ed, then renamed over `path`. A crash or a
+    /// concurrent reader therefore never observes a truncated or partially
+    /// written `settings.toml`; on any failure the original file is left intact.
+    /// `load` fails closed on a corrupt file, so a torn write would otherwise
+    /// lose the settings entirely.
     ///
     /// # Errors
     ///
@@ -92,8 +102,88 @@ impl Settings {
             std::fs::create_dir_all(parent)
                 .map_err(|e| PlatformError::io("create settings directory", e))?;
         }
-        std::fs::write(path, self.to_toml())
-            .map_err(|e| PlatformError::io("write settings file", e))
+        atomic_write(path, &self.to_toml())
+    }
+}
+
+/// Atomically replace `path`'s contents with `text`.
+///
+/// Mirrors the vault's write discipline in `passman-core::storage::atomic_write`
+/// (reimplemented here so this crate has no dependency on the core): write a
+/// sibling temp file in the **same directory** so the final `rename` is a
+/// same-filesystem atomic operation, `sync_all` it, then rename it over `path`.
+/// On any failure the temp file is removed best-effort and the original `path`
+/// is left untouched.
+fn atomic_write(path: &Path, text: &str) -> Result<(), PlatformError> {
+    let tmp_path = temp_sibling(path);
+
+    // Write + fsync the temp; on any failure remove it and leave `path` intact.
+    if let Err(e) = write_temp(&tmp_path, text.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    // The rename is atomic on the same filesystem: a reader sees either the old
+    // file or the fully written new one, never a torn write.
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(PlatformError::io(
+            "rename temp settings file over target",
+            e,
+        ));
+    }
+
+    Ok(())
+}
+
+/// Create a fresh temp file, write all of `bytes`, and `sync_all` it.
+///
+/// On Unix the file is created `0o600` (owner-only) with `create_new` (`O_EXCL`)
+/// so the mode is set on a file we exclusively created and a pre-existing temp
+/// is never clobbered. The `sync_all` flushes data and metadata before the
+/// caller renames, so a crash cannot expose a zero-length or partial file.
+fn write_temp(tmp_path: &Path, bytes: &[u8]) -> Result<(), PlatformError> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // The settings file is non-secret, but owner-only is still correct.
+        opts.mode(0o600);
+    }
+    let mut tmp = opts
+        .open(tmp_path)
+        .map_err(|e| PlatformError::io("create temp settings file", e))?;
+    tmp.write_all(bytes)
+        .map_err(|e| PlatformError::io("write temp settings file", e))?;
+    tmp.sync_all()
+        .map_err(|e| PlatformError::io("fsync temp settings file", e))?;
+    Ok(())
+}
+
+/// Derive the temp sibling path used by [`atomic_write`].
+///
+/// Same directory as `path`, with a leading dot plus the process id, a monotonic
+/// counter, and a nanosecond timestamp so concurrent or repeated saves never
+/// collide. Combined with the `create_new` (`O_EXCL`) open in [`write_temp`], a
+/// name clash fails the save loudly rather than overwriting another temp.
+fn temp_sibling(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let file_name = path.file_name().map_or_else(
+        || String::from("settings"),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let pid = std::process::id();
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let tmp_name = format!(".{file_name}.{pid}.{nanos}.{seq}.tmp");
+    match path.parent() {
+        Some(parent) => parent.join(tmp_name),
+        None => PathBuf::from(tmp_name),
     }
 }
 
@@ -186,5 +276,53 @@ mod tests {
             Settings::load(&path),
             Err(PlatformError::Settings(_))
         ));
+    }
+
+    #[test]
+    fn atomic_save_round_trips_and_leaves_no_temp_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("settings.toml");
+        let s = Settings {
+            update_check: true,
+            totp_seed_pin: true,
+            clipboard_fact_overwrite: false,
+        };
+        s.save(&path).expect("save");
+        assert_eq!(Settings::load(&path).expect("reload"), s);
+        // The atomic write must not leave its temp sibling behind: the only
+        // entry in the directory is the target file itself.
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("settings.toml")]);
+    }
+
+    #[test]
+    fn load_corrupt_file_fails_closed_without_panic() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("settings.toml");
+        // Non-UTF8 / non-TOML garbage (e.g. a torn write) must surface an error,
+        // never panic and never silently fall back to defaults.
+        std::fs::write(&path, [0xff, 0xfe, 0x00, 0x01, b'=', 0xff]).expect("write garbage");
+        assert!(
+            Settings::load(&path).is_err(),
+            "a corrupt settings file must fail closed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_settings_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("settings.toml");
+        Settings::default().save(&path).expect("save");
+        let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "settings file must be owner-only (0o600)"
+        );
     }
 }

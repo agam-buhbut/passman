@@ -6,6 +6,28 @@
 //! hardware dictionary-attack lockout here** — only the advisory app timer in
 //! `passman-core` applies, which §6.2/§4.9 document as weak.
 //!
+//! # Confidentiality boundary
+//!
+//! The stored secret's true confidentiality boundary is the **login session**,
+//! not the passman process. Once the user's login keyring is unlocked, the
+//! Secret Service hands the secret to **any process running as that user in the
+//! same session** that asks for it over D-Bus — there is no per-application
+//! isolation and (unlike the hardware backends) no per-use biometric/PIN gate.
+//! A malicious or compromised process in the session can read `K_hsm` / the TOTP
+//! seed directly. This is an accepted property of the documented weak fallback,
+//! alongside the no-hardware-DA caveat above; it is *not* equivalent to a
+//! hardware-sealed slot.
+//!
+//! # Re-enroll contract (caller must invalidate first)
+//!
+//! [`SecretServiceKeyStore::enroll`] mints a **fresh** enrollment uuid and
+//! writes a new keyring credential every call; it does **not** invalidate any
+//! previously enrolled credential for the slot. A blind re-enroll therefore
+//! leaves the old secret readable in the keyring under its old uuid (an
+//! orphaned credential the new blob no longer references). **The caller MUST
+//! invalidate the prior blob (via [`HardwareKeyStore::invalidate`]) before
+//! re-enrolling a slot**, so the superseded secret is actually removed.
+//!
 //! # What lives where
 //!
 //! The 32-byte slot secret (`K_hsm` or the TOTP seed `S`) is written into the

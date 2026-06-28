@@ -316,7 +316,9 @@ impl HardwareKeyStore for MockKeyStore {
             PromptResult::Cancelled => return Err(HsmError::Cancelled),
         }
 
-        let state = handle.into_mock();
+        // `into_mock` now fails closed (returns `Err`) if the handle was minted
+        // by another backend, rather than panicking; propagate that.
+        let state = handle.into_mock()?;
 
         // Rebuild the AAD from the stored slot tag; a tampered tag, wrong slot,
         // or wrong key all fail the AEAD with a detail-free error.
