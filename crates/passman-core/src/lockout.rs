@@ -237,7 +237,9 @@ mod tests {
         let st = LockoutState::new(3, 1_000); // 10-minute (600 s) window
         let unlock_at = 1_000 + 600;
         // One second before the boundary: still locked.
-        assert!(st.remaining(Timestamp::from_unix_secs(unlock_at - 1)).is_some());
+        assert!(st
+            .remaining(Timestamp::from_unix_secs(unlock_at - 1))
+            .is_some());
         // Exactly at the boundary: cleared.
         assert!(st.remaining(Timestamp::from_unix_secs(unlock_at)).is_none());
         // A large forward jump well past the window: also cleared (not fail-closed).
