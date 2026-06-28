@@ -54,12 +54,14 @@ impl SystemClipboard {
     }
 }
 
-/// SHA-256 of `text`, scrubbing the transient copy afterwards.
+/// SHA-256 of `text`, hashing the borrowed bytes directly.
+///
+/// No intermediate `Vec` is made: copying the secret into a fresh heap buffer
+/// just to hash it would leave a second plaintext copy to scrub (and risk it
+/// surviving if the scrub were elided). `Sha256` reads the borrowed bytes in
+/// place, so the only copy of the secret is the caller's `SecretString`.
 fn digest(text: &str) -> [u8; 32] {
-    let mut buf = text.as_bytes().to_vec();
-    let out: [u8; 32] = Sha256::digest(&buf).into();
-    buf.zeroize();
-    out
+    Sha256::digest(text.as_bytes()).into()
 }
 
 /// Map an `arboard` error to a core error a shell is allowed to construct.
@@ -73,8 +75,11 @@ impl Clipboard for SystemClipboard {
         let d = digest(text);
         self.with("clipboard write", |c| c.set_text(text.to_owned()))
             .map_err(|e| clip_err("clipboard write", &e))?;
-        // `written_at` is process-local and currently informational; stamp it
-        // from the system clock for honesty.
+        // `written_at` is process-local and purely informational (the post-copy
+        // clear matches on the digest, never on this timestamp), so it is stamped
+        // from `SystemClock` directly rather than threading the session `Clock`
+        // through `SystemClipboard` — doing so would change the public `new()`
+        // signature and ripple into the shell for no behavioural gain.
         Ok(ClipboardCookie::new(d, SystemClock.now()))
     }
 

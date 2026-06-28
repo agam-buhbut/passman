@@ -4,6 +4,15 @@
 //! ([`OsRng`]); there is no seeded or userspace PRNG anywhere. Uniform sampling
 //! uses rejection sampling to avoid the modulo bias a naive `% range` would
 //! introduce (threat #24).
+//!
+//! # Accepted residual (performance)
+//!
+//! Each character (and each shuffle index) draws a fresh `u32` straight from
+//! `OsRng`, i.e. one syscall-backed CSPRNG read per draw rather than buffering a
+//! larger block. Generation is an interactive, one-shot action (a single
+//! password of at most [`MAX_LENGTH`] chars), not a hot loop, so the per-draw
+//! cost is irrelevant; the simplicity and the absence of any userspace PRNG
+//! state to manage or zeroize is worth more than batching the RNG reads here.
 
 use passman_crypto::SecretString;
 use rand::rngs::OsRng;
@@ -351,6 +360,34 @@ mod tests {
             }
         }
         assert!(seen_a && seen_b);
+    }
+
+    #[test]
+    fn uniform_from_is_statistically_balanced() {
+        // Lock in the no-modulo-bias property (threat #24). The pool size (10)
+        // does not divide 2^32, so the rejection zone is genuinely exercised; a
+        // naive `% n` sampler would over-weight the low digits. The tolerance is
+        // deliberately wide: the expected per-symbol count is ~20k with a
+        // std-dev of ~134, so the +-15% band is >20 sigma — astronomically
+        // unlikely to fail by chance, yet tight enough to catch any gross bias.
+        let mut rng = OsRng;
+        let pool: Vec<char> = "0123456789".chars().collect();
+        let draws = 200_000usize;
+        let mut counts = vec![0usize; pool.len()];
+        for _ in 0..draws {
+            let ch = uniform_from(&pool, &mut rng);
+            let idx = pool.iter().position(|&p| p == ch).expect("char in pool");
+            counts[idx] += 1;
+        }
+        let expected = draws / pool.len();
+        let low = expected * 85 / 100;
+        let high = expected * 115 / 100;
+        for (digit, &count) in counts.iter().enumerate() {
+            assert!(
+                (low..=high).contains(&count),
+                "digit {digit} count {count} outside [{low}, {high}] (~{expected} expected)"
+            );
+        }
     }
 
     #[test]

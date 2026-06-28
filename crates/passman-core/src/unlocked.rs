@@ -10,14 +10,13 @@
 //! Passwords are decrypted **on demand** (reveal / copy / export), never in
 //! bulk; only labels live in memory while unlocked (§4.4).
 
-use passman_crypto::{ct_eq, MasterKey, SecretArray, SecretString};
+use passman_crypto::{ct_eq, MasterKey, SecretString};
 use passman_hsm::{BiometricPrompter, HsmSlot};
 use passman_policy::{
     classify, estimate_master, generate, EntryPolicy, GenerationRequest, MasterEntropy,
 };
 use passman_recovery::{export, ExportPayload, RecoveryEntry, RecoveryPreset};
 use passman_vault::{EntryId, EntryRecord, Index, IndexEntry, Vault};
-use zeroize::Zeroize;
 
 use crate::app::{App, KEY_LEN};
 use crate::clipboard::{random_fact, ClearOutcome, Clipboard, ClipboardCookie};
@@ -449,10 +448,11 @@ impl<'a, H: passman_hsm::HardwareKeyStore> UnlockedApp<'a, H> {
         vault.verify_probe(&reauth_master)?;
 
         // Build the payload: decrypt each entry, translate the policy.
-        let seed_arr =
-            key_from_bytes(&seed).ok_or(CoreError::Hsm(passman_hsm::HsmError::MalformedBlob {
+        let seed_arr = crate::app::into_key(&seed).ok_or(CoreError::Hsm(
+            passman_hsm::HsmError::MalformedBlob {
                 reason: "unwrapped TOTP seed is not 32 bytes",
-            }))?;
+            },
+        ))?;
         let mut entries: Vec<RecoveryEntry> = Vec::with_capacity(self.index.len());
         for row in self.index.entries() {
             let record = vault.decrypt_entry(&reauth_master, &row.id)?;
@@ -625,23 +625,6 @@ fn recovery_entry_from(row: &IndexEntry, record: &EntryRecord) -> Result<Recover
         notes: SecretString::new(record.notes.expose().to_owned()),
         policy: policy_bytes,
     })
-}
-
-/// Copy a [`passman_crypto::SecretBytes`] of exactly [`KEY_LEN`] into a
-/// [`SecretArray`].
-fn key_from_bytes(bytes: &passman_crypto::SecretBytes) -> Option<SecretArray<KEY_LEN>> {
-    if bytes.expose().len() == KEY_LEN {
-        let mut arr = [0u8; KEY_LEN];
-        arr.copy_from_slice(bytes.expose());
-        let key = SecretArray::new(arr);
-        // `arr` is `Copy` and unused hereafter, so `fill(0)` would be a dead
-        // non-volatile store the optimizer may elide. `zeroize` is a volatile,
-        // non-elidable write — the key copy must not survive on the stack.
-        arr.zeroize();
-        Some(key)
-    } else {
-        None
-    }
 }
 
 /// Translate a [`RecoveryEntry`] back to its parts for re-encryption on import

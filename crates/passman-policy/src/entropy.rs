@@ -105,6 +105,16 @@ pub struct MasterEntropy {
 ///
 /// Returns `0.0` for a degenerate `charset_size < 2` (no entropy per character)
 /// or `length == 0`, rather than a negative or non-finite value.
+///
+/// # Accepted residual
+///
+/// This closed form is exact only for i.i.d. uniform draws over the full
+/// `charset_size` alphabet. The generator first places each required-class
+/// minimum (sampled from that class's sub-alphabet) before filling the rest from
+/// the full set, so a few positions are drawn from a smaller alphabet — making
+/// the true entropy marginally *lower* than this figure. The gap is treated as
+/// negligible: for the default policy (one-of-each minimums over the 94-char
+/// set, length 40) it is a fraction of a bit against ~262, far above any gate.
 #[must_use]
 pub fn generated_entropy_bits(charset_size: usize, length: u16) -> f64 {
     if charset_size < 2 || length == 0 {

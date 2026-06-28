@@ -679,7 +679,11 @@ mod tests {
             ciphertext: &[u8],
         ) -> Result<Vec<u8>, KeystoreError> {
             let keys = self.keys.lock().expect("mock keys mutex");
-            let key = keys.get(alias).ok_or(KeystoreError::KeyInvalidated)?;
+            // Parity with the real backend: an unknown/destroyed alias means
+            // `KeyStore.getKey()` returns null, which the Kotlin shim normalizes
+            // to `KeystoreError::Backend` (not `KeyInvalidated`, which is reserved
+            // for a `KeyPermanentlyInvalidatedException` on an existing key).
+            let key = keys.get(alias).ok_or(KeystoreError::Backend)?;
             let nonce = Self::nonce_from_iv(iv);
             let plaintext = aead::decrypt(key, &nonce, &[slot_tag], ciphertext)
                 .map_err(|_| KeystoreError::AuthFailed)?;
@@ -1040,14 +1044,18 @@ mod tests {
             .expect("invalidate");
         assert_eq!(mock.key_count(), 0);
 
-        // A subsequent unwrap of the same blob now finds no key.
+        // A subsequent unwrap of the same blob now finds no key. The real
+        // backend's `getKey()` returns null for a destroyed alias, which routes
+        // to `KeystoreError::Backend` -> `HsmError::Backend` (see the mock's
+        // `unwrap`); `KeyInvalidated`/`PermanentlyInvalidated` is reserved for an
+        // existing-but-invalidated key, not a missing one.
         let handle = store
             .begin_unwrap(HsmSlot::VaultKey, &blob, &())
             .expect("begin");
         let err = store
             .complete_unwrap(handle, &prompter)
             .expect_err("key gone");
-        assert!(matches!(err, HsmError::PermanentlyInvalidated));
+        assert!(matches!(err, HsmError::Backend(_)));
     }
 
     // ---- Capabilities (probe surfacing) -----------------------------------

@@ -215,8 +215,10 @@ impl Vault {
     ///
     /// # Errors
     ///
-    /// [`VaultError::Crypto`] if the probe or index AEAD encryption fails (does
-    /// not happen for well-formed inputs).
+    /// - [`VaultError::BlobTooLarge`] if either HSM wrap blob exceeds the `u16`
+    ///   on-disk length bound ([`MAX_HSM_BLOB_LEN`]).
+    /// - [`VaultError::Crypto`] if the probe or index AEAD encryption fails (does
+    ///   not happen for well-formed inputs).
     pub fn create(
         kdf_params: KdfParams,
         vault_salt: [u8; SALT_LEN],
@@ -225,6 +227,11 @@ impl Vault {
         metadata: VaultMetadata,
         k_master: &MasterKey,
     ) -> Result<Self, VaultError> {
+        // Enforce the u16 on-disk bound up front so `to_bytes` can never clamp a
+        // blob length and emit a corrupt, unparseable vault.
+        check_blob_len(&k_hsm_wrap_blob, "k_hsm_wrap_blob")?;
+        check_blob_len(&totp_seed_wrap_blob, "totp_seed_wrap_blob")?;
+
         let probe_nonce = random_nonce();
         let probe_ad = probe_associated_data(
             FORMAT_VERSION,
@@ -423,9 +430,22 @@ impl Vault {
 
     /// Replace the two opaque HSM wrap blobs (e.g. after HSM re-enrollment,
     /// `architecture.md` §6.6). The blobs are opaque to this crate.
-    pub fn set_hsm_blobs(&mut self, k_hsm_wrap_blob: Vec<u8>, totp_seed_wrap_blob: Vec<u8>) {
+    ///
+    /// # Errors
+    ///
+    /// [`VaultError::BlobTooLarge`] if either blob exceeds the `u16` on-disk
+    /// length bound ([`MAX_HSM_BLOB_LEN`]); the vault is left unchanged in that
+    /// case (both blobs are validated before either is stored).
+    pub fn set_hsm_blobs(
+        &mut self,
+        k_hsm_wrap_blob: Vec<u8>,
+        totp_seed_wrap_blob: Vec<u8>,
+    ) -> Result<(), VaultError> {
+        check_blob_len(&k_hsm_wrap_blob, "k_hsm_wrap_blob")?;
+        check_blob_len(&totp_seed_wrap_blob, "totp_seed_wrap_blob")?;
         self.k_hsm_wrap_blob = k_hsm_wrap_blob;
         self.totp_seed_wrap_blob = totp_seed_wrap_blob;
+        Ok(())
     }
 
     // ----- Internal index helpers ---------------------------------------------
@@ -811,10 +831,28 @@ fn encrypt_entry(
     })
 }
 
-/// Append `blob` to `out` as `u16-LE length ‖ blob`. A blob longer than
-/// `u16::MAX` is clamped in the length field; HSM wrap blobs are far smaller
-/// (§6.3 bounds them with a `u16` length), so this clamp is never hit in
-/// practice and is only a defensive cap.
+/// The maximum length of an opaque HSM wrap blob the on-disk format can encode:
+/// the §4.7 layout length-prefixes each blob with a `u16`. The §6.3 blobs sit
+/// far below this in practice; the bound is enforced at every mutation boundary
+/// ([`Vault::create`], [`Vault::set_hsm_blobs`]) so the `u16` length field in
+/// [`Vault::to_bytes`] can never silently clamp.
+const MAX_HSM_BLOB_LEN: usize = u16::MAX as usize;
+
+/// Reject an HSM wrap blob whose length would not fit the `u16` on-disk length
+/// prefix (see [`MAX_HSM_BLOB_LEN`]).
+fn check_blob_len(blob: &[u8], which: &'static str) -> Result<(), VaultError> {
+    if blob.len() > MAX_HSM_BLOB_LEN {
+        return Err(VaultError::BlobTooLarge { which });
+    }
+    Ok(())
+}
+
+/// Append `blob` to `out` as `u16-LE length ‖ blob`.
+///
+/// A blob longer than `u16::MAX` would clamp the length field and desync the
+/// stream, but that is **unreachable**: every blob entering the vault is bounded
+/// by [`check_blob_len`] at construction/mutation, so the clamp here is only a
+/// last-resort defensive backstop for the otherwise-impossible case.
 fn push_u16_prefixed(out: &mut Vec<u8>, blob: &[u8]) {
     let len = u16::try_from(blob.len()).unwrap_or(u16::MAX);
     out.extend_from_slice(&len.to_le_bytes());

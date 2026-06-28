@@ -118,9 +118,13 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
         return Err(CoreError::io("rename temp vault file over target", e));
     }
 
-    // fsync the directory so the rename itself is durable. A failure here means
-    // the rename may not survive a power loss, but the data file is already
-    // safely written; surface it rather than silently ignoring it.
+    // Best-effort directory fsync so the rename entry itself is durable across a
+    // power loss. Both the open and the sync_all errors are *intentionally*
+    // ignored: the data file's contents were already fsynced above, so the new
+    // vault is safe on disk; only the rename's power-loss durability is
+    // best-effort here, and the rename has already succeeded, so a failure to
+    // fsync the directory must not turn an otherwise-complete write into an
+    // error. (Some filesystems also reject fsync on a directory handle.)
     if let Ok(dir_handle) = File::open(dir) {
         let _ = dir_handle.sync_all();
     }

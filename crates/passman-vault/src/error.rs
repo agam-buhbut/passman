@@ -88,6 +88,20 @@ pub enum VaultError {
     #[error("no entry with the requested id")]
     EntryNotFound,
 
+    /// An opaque HSM wrap blob exceeded the `u16` length the on-disk format can
+    /// encode (`architecture.md` §4.7 length-prefixes each blob with a `u16`).
+    ///
+    /// The §6.3 blobs sit far below this in practice; enforcing the bound at the
+    /// construction/mutation boundary stops [`crate::Vault::to_bytes`] from
+    /// silently clamping the length field and producing a corrupt, unparseable
+    /// vault.
+    #[error("HSM wrap blob too large to serialize: {which}")]
+    BlobTooLarge {
+        /// Which blob hit the limit (`"k_hsm_wrap_blob"` or
+        /// `"totp_seed_wrap_blob"`).
+        which: &'static str,
+    },
+
     /// A cryptographic operation failed.
     ///
     /// Wraps [`CryptoError`]; for AEAD authentication this is deliberately

@@ -437,6 +437,74 @@ fn advisory_lockout_after_three_failures_then_clears() {
     assert!(matches!(err, UnlockError::BadCredentials));
 }
 
+/// The advisory counter is persisted lazily: pre-threshold failures are
+/// coalesced in memory (no full-vault rewrite per attempt), and the on-disk
+/// counter is only flushed once a failure actually imposes a lockout window —
+/// but the lockout still escalates correctly across attempts in one process.
+#[test]
+fn advisory_counter_persists_lazily_but_still_drives_lockout() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clock = TestClock::at(5_000_000);
+    let app = open_app(dir.path(), clock.clone());
+    let prompter = MockPrompter::authenticating();
+
+    let (unlocked, uri) = app
+        .create_vault(
+            &pw("Str0ng-Master-P@ssphrase!"),
+            FAST_KDF,
+            TotpConfig::default(),
+            &(),
+            &prompter,
+        )
+        .expect("create");
+    let seed = seed_from_uri(uri.expose());
+    unlocked.lock();
+
+    // Reads the advisory counter straight off the persisted vault file (no lock
+    // needed for a plain read; the app keeps holding the instance lock).
+    let disk_counter = || {
+        let bytes = std::fs::read(app.vault_path()).expect("read vault");
+        passman_vault::Vault::from_bytes(&bytes)
+            .expect("parse vault")
+            .rl_counter()
+    };
+
+    // Two sub-threshold failures (counter 1, 2 < 3): coalesced in memory, the
+    // on-disk counter is NOT bumped (no per-attempt full-vault fsync).
+    for _ in 0..2 {
+        let code = valid_code(&seed, clock.now_secs());
+        let err = app
+            .unlock(&pw("nope"), &code, &(), &prompter)
+            .expect_err("fail");
+        assert!(matches!(err, UnlockError::BadCredentials));
+    }
+    assert_eq!(
+        disk_counter(),
+        0,
+        "sub-threshold failures must be coalesced, not persisted"
+    );
+
+    // The third failure crosses into a lockout window and IS persisted.
+    let code = valid_code(&seed, clock.now_secs());
+    let err = app
+        .unlock(&pw("nope"), &code, &(), &prompter)
+        .expect_err("fail");
+    assert!(matches!(err, UnlockError::BadCredentials));
+    assert!(
+        disk_counter() >= 3,
+        "the threshold-crossing failure must be persisted (got {})",
+        disk_counter()
+    );
+
+    // And the lockout is now in effect: a 4th attempt, even with correct creds,
+    // is refused — escalation survived the coalescing.
+    let code = valid_code(&seed, clock.now_secs());
+    let err = app
+        .unlock(&pw("Str0ng-Master-P@ssphrase!"), &code, &(), &prompter)
+        .expect_err("locked");
+    assert!(matches!(err, UnlockError::LockedOut { .. }));
+}
+
 #[test]
 fn hsm_cancelled_routes_to_cancelled_without_penalty() {
     let dir = tempfile::tempdir().expect("tempdir");

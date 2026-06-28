@@ -79,6 +79,13 @@ pub struct App<H: HardwareKeyStore> {
     /// attempts in one process (§4.3 step 4), so it lives here behind a mutex
     /// rather than being recreated per attempt.
     verifier: Mutex<Option<TotpVerifier>>,
+    /// In-process advisory-lockout state, coalesced across unlock attempts so a
+    /// stream of failures does not rewrite the whole vault on every attempt
+    /// (perf — see [`App::record_failure`]). It is merged conservatively with
+    /// the on-disk counter on each unlock ([`App::merge_lockout`]) and only
+    /// flushed to disk once a failure actually imposes a lockout window. Starts
+    /// reset; the on-disk header remains the durable, cross-process record.
+    lockout_mem: Mutex<LockoutState>,
 }
 
 impl<H: HardwareKeyStore> App<H> {
@@ -109,6 +116,7 @@ impl<H: HardwareKeyStore> App<H> {
             allow_software_hsm: false,
             totp_config: Mutex::new(TotpConfig::default()),
             verifier: Mutex::new(None),
+            lockout_mem: Mutex::new(LockoutState::reset()),
         })
     }
 
@@ -268,7 +276,12 @@ impl<H: HardwareKeyStore> App<H> {
         }
 
         let now = self.clock.now();
-        let mut state = LockoutState::new(vault.rl_counter(), vault.rl_last_failure());
+        // Merge the durable on-disk advisory counter with the in-process
+        // coalesced state (conservatively — the longer lockout wins) so a stream
+        // of failures escalates correctly even when sub-threshold failures were
+        // not flushed to disk (see `record_failure` / `merge_lockout`).
+        let disk_state = LockoutState::new(vault.rl_counter(), vault.rl_last_failure());
+        let mut state = self.merge_lockout(disk_state);
 
         // Step 3 (HSM-native DA lockout, §4.3): the *authoritative* anti-hammering
         // control. Queried before the unwraps so an already-locked device never
@@ -344,7 +357,13 @@ impl<H: HardwareKeyStore> App<H> {
             .map_err(|e| UnlockError::MalformedVault(e.into()))?;
 
         // Step 8: success — reset the advisory counter (persist) and build the
-        // session.
+        // session. Always clear the in-process coalesced state, even when the
+        // on-disk header is already clean (sub-threshold failures may have been
+        // coalesced in memory without ever touching disk).
+        *self
+            .lockout_mem
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = LockoutState::reset();
         if vault.rl_counter() != 0 || vault.rl_last_failure() != 0 {
             let reset = LockoutState::reset();
             vault.set_rate_limit(reset.counter, reset.last_failure);
@@ -493,11 +512,46 @@ impl<H: HardwareKeyStore> App<H> {
         verifier.verify(seed, code, now).map_err(|_| ())
     }
 
-    /// Record one advisory failure: bump the state and persist it to the vault
-    /// header (`architecture.md` §4.9). A persist failure is intentionally
-    /// swallowed — the advisory counter is not a security boundary, so failing
-    /// to write it must not change the (already determined) `BadCredentials`
-    /// outcome, and there is no secret to leak in this path.
+    /// Merge the on-disk advisory state with the in-process coalesced state,
+    /// adopting the more conservative (longer-lockout) value of each field.
+    ///
+    /// `lockout_minutes` is non-decreasing in the counter and the remaining
+    /// window grows with `last_failure`, so taking the max of each field can only
+    /// *lengthen* a lockout, never shorten one. This makes the coalescing fail
+    /// safe: a stale-low on-disk counter is out-voted by the higher in-memory
+    /// value, so the merged state over-counts rather than under-counts (§4.9 —
+    /// the advisory counter is not a security boundary; the HSM-native DA lockout
+    /// is). The merged value is adopted as the new in-memory state.
+    fn merge_lockout(&self, disk: LockoutState) -> LockoutState {
+        let mut mem = self
+            .lockout_mem
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let merged = LockoutState::new(
+            disk.counter.max(mem.counter),
+            disk.last_failure.max(mem.last_failure),
+        );
+        *mem = merged;
+        merged
+    }
+
+    /// Record one advisory failure (`architecture.md` §4.9): bump the state,
+    /// adopt it in the in-process coalesced cache, and persist to the vault
+    /// header **only once the failure actually imposes a lockout window**.
+    ///
+    /// Throttle: pre-threshold failures (`lockout_minutes == 0`) impose no
+    /// lockout, so they are coalesced in memory and not flushed — this denies a
+    /// no-factor attacker who hits the pre-Argon2 TOTP early-exit a full
+    /// temp+fsync+rename of the entire vault per attempt. Skipping them is safe:
+    /// the on-disk counter then only ever lags (it can over-count a future
+    /// attempt via [`Self::merge_lockout`], never under-count within a live
+    /// process), and the advisory counter is explicitly not a security boundary
+    /// (the HSM-native DA lockout is). From the threshold up, every failure is
+    /// persisted so `last_failure` keeps refreshing and the window escalates.
+    ///
+    /// A persist failure is intentionally swallowed — failing to write the
+    /// advisory counter must not change the (already determined)
+    /// `BadCredentials` outcome, and there is no secret to leak in this path.
     fn record_failure(
         &self,
         vault: &mut Vault,
@@ -506,8 +560,16 @@ impl<H: HardwareKeyStore> App<H> {
     ) {
         *state = state.after_failure(now);
         vault.set_rate_limit(state.counter, state.last_failure);
-        // Best-effort persistence; see the doc comment.
-        let _ = crate::storage::atomic_write(&self.vault_path, &vault.to_bytes());
+        // Adopt the new count so a later attempt in this process keeps escalating
+        // even when the disk write below is skipped.
+        *self
+            .lockout_mem
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = *state;
+        if crate::lockout::lockout_minutes(state.counter) > 0 {
+            // Best-effort persistence; see the doc comment.
+            let _ = crate::storage::atomic_write(&self.vault_path, &vault.to_bytes());
+        }
     }
 
     /// Build an [`UnlockedApp`] with a fresh session token and a 120 s expiry.
@@ -634,7 +696,11 @@ pub(crate) fn derive_master_from_bytes(
 }
 
 /// Copy a [`SecretBytes`] of exactly [`KEY_LEN`] into a [`SecretArray`].
-fn into_key(bytes: &SecretBytes) -> Option<SecretArray<KEY_LEN>> {
+///
+/// Shared crate-internal helper for the two unwrap sites (`K_hsm` here and the
+/// TOTP seed in [`crate::unlocked`]) that both turn a freshly-unwrapped
+/// [`SecretBytes`] into a fixed `[u8; 32]` key, zeroizing the temporary copy.
+pub(crate) fn into_key(bytes: &SecretBytes) -> Option<SecretArray<KEY_LEN>> {
     if bytes.expose().len() == KEY_LEN {
         let mut arr = [0u8; KEY_LEN];
         arr.copy_from_slice(bytes.expose());

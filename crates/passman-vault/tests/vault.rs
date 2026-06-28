@@ -571,7 +571,9 @@ fn mutating_a_v1_vault_does_not_corrupt_its_index() {
     let reloaded = Vault::from_bytes(&parsed.to_bytes()).expect("mutated v1 parses");
     assert_eq!(reloaded.format_version(), 0x01, "stays v1 on disk");
     reloaded.verify_probe(&km).expect("probe still verifies");
-    let idx = reloaded.open_index(&km).expect("index opens after v1 mutation");
+    let idx = reloaded
+        .open_index(&km)
+        .expect("index opens after v1 mutation");
     assert_eq!(idx.len(), 2, "one removed, one added");
     assert!(idx.get(&ids[0]).is_none(), "removed entry is gone");
     assert!(idx.get(&new_id).is_some(), "added entry present");
@@ -1028,4 +1030,93 @@ fn encode_record_padded(rec: &EntryRecord) -> Vec<u8> {
         off += f.len();
     }
     buf
+}
+
+// ---------------------------------------------------------------------------
+// HSM wrap-blob u16 length bound (§4.7 / §6.3)
+// ---------------------------------------------------------------------------
+
+/// The on-disk format length-prefixes each HSM wrap blob with a `u16`, so a blob
+/// at exactly `u16::MAX` bytes is the largest that can be encoded. It must
+/// construct, serialize, and re-parse losslessly (no silent length clamp).
+#[test]
+fn max_size_hsm_blob_round_trips() {
+    let blob = vec![0x5A_u8; usize::from(u16::MAX)];
+    let vault = Vault::create(
+        fixed_params(),
+        fixed_salt(),
+        blob.clone(),
+        vec![0x01, 0x02],
+        meta(),
+        &k_master(),
+    )
+    .expect("create with max-size blob");
+
+    let parsed = Vault::from_bytes(&vault.to_bytes()).expect("round-trip max-size blob");
+    assert_eq!(parsed.k_hsm_wrap_blob(), blob.as_slice());
+    assert_eq!(parsed.totp_seed_wrap_blob(), &[0x01, 0x02]);
+}
+
+/// A blob one byte past `u16::MAX` cannot be length-encoded; `create` must
+/// reject it with `BlobTooLarge` rather than producing a vault that `to_bytes`
+/// would silently corrupt.
+#[test]
+fn create_rejects_oversized_hsm_blob() {
+    let oversized = vec![0u8; usize::from(u16::MAX) + 1];
+    let err = Vault::create(
+        fixed_params(),
+        fixed_salt(),
+        oversized,
+        vec![0x01, 0x02],
+        meta(),
+        &k_master(),
+    )
+    .expect_err("oversized k_hsm blob must be rejected");
+    assert!(matches!(
+        err,
+        VaultError::BlobTooLarge {
+            which: "k_hsm_wrap_blob"
+        }
+    ));
+
+    let oversized = vec![0u8; usize::from(u16::MAX) + 1];
+    let err = Vault::create(
+        fixed_params(),
+        fixed_salt(),
+        vec![0xAA, 0xBB],
+        oversized,
+        meta(),
+        &k_master(),
+    )
+    .expect_err("oversized totp_seed blob must be rejected");
+    assert!(matches!(
+        err,
+        VaultError::BlobTooLarge {
+            which: "totp_seed_wrap_blob"
+        }
+    ));
+}
+
+/// `set_hsm_blobs` enforces the same bound and leaves the vault unchanged when a
+/// blob is too large (both blobs are validated before either is stored).
+#[test]
+fn set_hsm_blobs_enforces_u16_bound() {
+    let mut vault = empty_vault();
+    let original_k_hsm = vault.k_hsm_wrap_blob().to_vec();
+
+    let err = vault
+        .set_hsm_blobs(vec![0u8; usize::from(u16::MAX) + 1], vec![0x09])
+        .expect_err("oversized blob must be rejected");
+    assert!(matches!(err, VaultError::BlobTooLarge { .. }));
+    // Unchanged: the rejected call stored neither blob.
+    assert_eq!(vault.k_hsm_wrap_blob(), original_k_hsm.as_slice());
+
+    // A valid replacement (including the max-size boundary) succeeds.
+    let max_blob = vec![0x33_u8; usize::from(u16::MAX)];
+    vault
+        .set_hsm_blobs(max_blob.clone(), vec![0x09])
+        .expect("valid blobs accepted");
+    let parsed = Vault::from_bytes(&vault.to_bytes()).expect("round-trip");
+    assert_eq!(parsed.k_hsm_wrap_blob(), max_blob.as_slice());
+    assert_eq!(parsed.totp_seed_wrap_blob(), &[0x09]);
 }
