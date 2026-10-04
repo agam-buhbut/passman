@@ -603,13 +603,13 @@ All length prefixes are `u32-LE`. `EntryPolicy` is serialized with `postcard` (a
 
 ### 7.4 Recovery Argon2id presets (intentionally aggressive)
 
-| Preset | m | t | p | ~time |
-|---|---|---|---|---|
-| Floor (refused below) | 1 GiB | 4 | 1 | ~2.5 s |
-| Default | 4 GiB | 8 | 1 | ~15 s |
-| Paranoid | 8 GiB | 12 | 1 | ~45 s |
+| Preset (shown to users as) | m | t | p | ~time | Free memory needed to export or restore |
+|---|---|---|---|---|---|
+| Floor (1 GB) — **the default**; export refuses anything weaker | 1 GiB | 4 | 1 | ~2.5 s | about 1.25 GB |
+| Default (4 GB) — name kept from before; no longer the default | 4 GiB | 8 | 1 | ~15 s | about 5 GB |
+| Paranoid (8 GB) | 8 GiB | 12 | 1 | ~45 s | about 10 GB |
 
-**Restore RAM requirement.** Importing a recovery file re-runs Argon2id at the file's own memory cost (see the host-aware guard in §4.8), so a Default file needs a restoring machine with roughly ≥5 GiB free RAM and a Paranoid file ≥9 GiB. This is intrinsic to Argon2 — the export is deliberately single-factor and aggressive, and the cost cannot be reduced at restore time without changing the derived key. Restore high-preset backups on a desktop, not a phone; a machine without enough RAM now fails the import cleanly with an actionable error rather than being OOM-killed. Pick `Floor` (1 GiB) if the backup must be restorable on a constrained/mobile device.
+**Restore RAM requirement.** Exporting or importing a recovery file runs Argon2id at the file's own memory cost, and the host-aware guard (§4.8) refuses a cost above 80% of the available RAM. So even the 1 GB default needs about 1.25 GB of free memory to export or restore; a 4 GB file needs about 5 GB and an 8 GB file about 10 GB. This is intrinsic to Argon2: the cost cannot be lowered at restore time without changing the derived key. A machine without enough free memory fails cleanly with an actionable error rather than being OOM-killed. Since 2026-10 (D28) every shell defaults to the 1 GB preset, so a default backup fits most phones and small laptops; users who will restore on a desktop can pick 4 GB or 8 GB (`--preset 4gb` / `--preset 8gb` in the CLI, the dropdown in GTK, the buttons on Android). Restore itself is CLI-only today (`passman import`).
 
 Because the `argon2` crate has no progress hook, the UI shows an **indeterminate** progress indicator with **elapsed time** ("Deriving recovery key… 12s"), running on the blocking pool — not a deterministic step counter.
 
@@ -631,7 +631,7 @@ Read header → prompt `P` → Argon2id → HKDF → AEAD-decrypt (wrong `P` →
 |---|---|
 | Forgotten master password | Permanently unreadable (by design) |
 | Lost HSM **and** no recovery file | Permanently unreadable (stern reminder at creation) |
-| Export stolen + master password known/guessed | Full disclosure; the Strong-password gate (§7.5) + aggressive Argon2 (4 GiB/8) is the only barrier — this is the dominant residual risk (§3.4) |
+| Export stolen + master password known/guessed | Full disclosure; the Strong-password gate (§7.5) + the recovery Argon2 (1 GiB / 4 passes by default; 4 or 8 GiB if chosen) is the only barrier — this is the dominant residual risk (§3.4) |
 | Forged entry inserted into export | Fails the AEAD tag (the tag is the integrity control) |
 | Old export after password change | Decrypts to old contents; user warned to regenerate |
 
@@ -684,7 +684,7 @@ pub struct EntryPolicy {
 
 The thresholds are **calibrated to zxcvbn's measurable range**: zxcvbn caps its guess estimate at `u64::MAX`, so `bits = log2(guesses)` saturates at ~64 — the 70/85-bit thresholds of earlier drafts were unreachable for any typed password. Generated passwords are scored by closed-form entropy (uncapped, ~262 bits for the default policy), not zxcvbn, so they sit far above any tier.
 
-**Export gate:** recovery export creation requires **Strong or above** (≥55 zxcvbn-bits) — see §7.5. This is safe despite being lower than a naive offline-brute-force bar because the export sits behind the 4 GiB / 8-pass recovery Argon2id (§7.4): at 55 bits, even granting an attacker a generous 10⁴ Argon2-guesses/s, cracking exceeds 10³ years. The weak-password sentinels still allow a weak password for the *vault itself* (which is HSM-gated and HSM-rate-limited), but you cannot create a single-factor export of a weakly-protected vault.
+**Export gate:** recovery export creation requires **Strong or above** (≥55 zxcvbn-bits) — see §7.5. This is safe despite being lower than a naive offline-brute-force bar because the export sits behind the recovery Argon2id (§7.4), by default 1 GiB / 4 passes. Each guess at that cost is roughly 8x cheaper than at the old 4 GiB / 8-pass default (a quarter of the memory, half the passes), so grant an attacker a generous 10⁵ Argon2-guesses/s instead of the 10⁴/s assumed before. At 55 bits, searching the whole space still takes about 11,000 years (about 5,700 on average). If memory is costed by chip area times time, the gap is up to 32x; at 3.2 × 10⁵ guesses/s the whole space still takes about 3,600 years (about 1,800 on average). So the margin is smaller than with the old default but stays above 10³ years, and the 4 GB and 8 GB presets keep the old margin or more. The weak-password sentinels still allow a weak password for the *vault itself* (which is HSM-gated and HSM-rate-limited), but you cannot create a single-factor export of a weakly-protected vault.
 
 ### 8.5 Crack-time display
 
@@ -776,7 +776,7 @@ No auto-update. The default binary makes **no network connections, ever**. An op
 | 16 | Mobile process introspection | High | `FLAG_SECURE`, snapshot suppression; rooted device accepted |
 | 17 | File-format downgrade | Medium | Version in AEAD AD; probe AD binds params; mismatch aborts |
 | 18 | Sealed-index size leakage | Low | 256-byte bucket padding; rewrite-on-save |
-| 19 | Recovery export brute-force | Critical | Strong-password gate (≥55 zxcvbn-bits) + aggressive Argon2id (4 GiB/8); dominant residual risk, foregrounded |
+| 19 | Recovery export brute-force | Critical | Strong-password gate (≥55 zxcvbn-bits) + aggressive Argon2id (1 GiB / 4 passes by default, 4 or 8 GiB if chosen; §8.4); dominant residual risk, foregrounded |
 | 20 | Recovery export tampering | High | AEAD tag binds payload + version + magic |
 | 21 | Malware exports via unlocked session | High | Fresh re-auth (master+TOTP+biometric) required, independent of `SessionToken` |
 | 22 | Recovery format downgrade | Medium | Version in AEAD AD |
@@ -810,7 +810,7 @@ No auto-update. The default binary makes **no network connections, ever**. An op
 | D10 | Lockout = **HSM-native primary**, app timer advisory-only UX | App counter is forgeable/rollback-able by the post-unwrap attacker; only the HSM can bind it (user choice) |
 | D11 | Session 120 s fixed, no sliding, 30 s post-copy | User choice |
 | D12 | Clipboard clear-by-overwrite with crypto facts | User choice |
-| D13 | Recovery default 4 GiB / 8 iter + **indeterminate** progress + elapsed time | High cost for a rare op; `argon2` has no per-iteration hook (researcher finding) |
+| D13 | Recovery default 4 GiB / 8 iter + **indeterminate** progress + elapsed time (default changed by D28) | High cost for a rare op; `argon2` has no per-iteration hook (researcher finding) |
 | D14 | Fresh re-auth required at export, independent of session token | Prevents malware exfiltration via unlocked session |
 | D15 | Master-password change invalidates old exports (warn + document) | Forward-secrecy expectation; cannot revoke files |
 | D16 | Weak master passwords gated by typed sentinel; **export blocked unless Strong** | User choice + close the weak-export hole |
@@ -825,6 +825,7 @@ No auto-update. The default binary makes **no network connections, ever**. An op
 | D25 | Generic `HardwareKeyStore`/`PlatformCtx` stay Rust-internal; `passman-uniffi` exports concrete per-platform fns | Generics/associated types cannot cross the UniFFI FFI |
 | D26 | Probe AD binds header params (version, kdf id, Argon2 params, salt) | Makes header tampering a clean authentication failure |
 | D27 | Single-instance advisory lock on the vault path | Prevents two instances racing a save / clobbering state |
+| D28 | Recovery export default lowered to 1 GiB / 4 passes (2026-10); presets shown by size: 1 GB / 4 GB / 8 GB | A restore needs the file's full Argon2 memory, and the guard (§4.8) keeps 20% of free memory in reserve, so the 4 GiB default needed about 5 GB free and could not be restored on phones or small laptops. The 55-bit export gate still holds at 1 GiB (§8.4). Supersedes the 4 GiB part of D13 (owner decision) |
 
 ---
 

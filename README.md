@@ -216,6 +216,11 @@ your master password is strong**. Keep the file somewhere safe — anyone who ha
 it and your password can read your vault. Changing your master password
 invalidates older exports.
 
+`passman export` uses the 1 GB preset by default, which is small enough for most
+phones. For a file that is harder to crack, add `--preset 4gb` or `--preset 8gb`.
+Restoring those needs about 5 GB or 10 GB of free memory, so restore them on a
+computer. The desktop and phone apps offer the same three sizes.
+
 ---
 
 ## Security at a glance
@@ -242,5 +247,8 @@ threat-coverage table, and key decisions.
   paths already support Windows); iOS is deferred.
 - **TPM access** on Linux may require adding your user to the `tss` group, or use
   `--allow-software-hsm`.
-- The recovery export uses a 1 GiB key-derivation floor, so creating one is slow
-  by design (a few seconds, once).
+- Recovery exports use the 1 GB preset by default. Creating or restoring one
+  takes a few seconds and needs about 1.25 GB of free memory; the 4 GB and 8 GB
+  presets need about 5 GB and 10 GB. Restoring works only from the CLI
+  (`passman import`) for now: the desktop and phone apps can create backups but
+  not restore them.

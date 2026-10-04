@@ -10,7 +10,9 @@
 > the check and its error are unchanged.) The A4 / A6 PARTIALs remain accepted
 > within the documented threat model; the preset/ceiling tuning the report
 > recommends (lowering `MAX_M_KIB` / the default recovery preset) is a
-> security/usability tradeoff deferred to a follow-up decision.
+> security/usability tradeoff deferred to a follow-up decision. (Update
+> 2026-10: the default recovery preset is now the 1 GiB Floor; users can still
+> pick 4 GB or 8 GB. `MAX_M_KIB` stays at 8 GiB.)
 
 ---
 
