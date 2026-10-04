@@ -111,12 +111,14 @@ pub fn export_within_memory(
 ///
 /// Separated so tests can round-trip with deliberately cheap Argon2 parameters
 /// (the public [`export`] always enforces the Floor, whose 1 GiB cost is far too
-/// slow for unit tests). Production code must call [`export`].
+/// slow for unit tests). Production code must call [`export`]. Compiled only for
+/// tests and the `test-util` feature, the two places that use it.
 ///
 /// # Errors
 ///
 /// [`RecoveryError::Crypto`] if Argon2id rejects the parameters or AEAD
 /// encryption fails.
+#[cfg(any(test, feature = "test-util"))]
 pub(crate) fn export_with(
     payload: &ExportPayload,
     password: &SecretString,
