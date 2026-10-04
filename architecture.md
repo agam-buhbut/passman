@@ -3,6 +3,7 @@
 - **Status:** Revised after multi-agent review (rev 2)
 - **Date:** 2026-05-28
 - **Scope:** Full system design for a highly-secure, local-only password manager targeting Linux (`.deb`), Windows, and Android (sideloaded APK). iOS is deferred.
+- **Built so far (2026-10):** Linux (CLI and GTK4 app, built from source with `install.sh`) and Android (Compose app, debug APK). The Windows UI and the `.deb` package are designed but not built.
 
 ---
 
@@ -50,6 +51,8 @@
 | Android | Jetpack Compose over UniFFI | Sideloaded APK |
 | iOS | (deferred) | — |
 
+**Status (2026-10):** only the Linux and Android rows exist. On Linux, `install.sh` builds two binaries (`passman`, `passman-gtk`) from source; there is no `.deb` yet. The Windows UI (`egui`) and its installer have not been built; `passman-platform` already resolves the Windows paths in §1.5.
+
 ### 1.5 Vault & settings storage locations
 
 | Platform | Vault file | Settings | Optional log |
@@ -70,7 +73,7 @@ TOTP is a **liveness/possession gate**, not a third cryptographic factor. The re
 - The TOTP code is a **mandatory unlock gate** verified against the independently-unwrapped `S`.
 - `S` is **not** mixed into the master-key KDF (it added no entropy there).
 
-What TOTP buys you: defense against an attacker who has your master password and can drive the HSM but cannot produce a current code (e.g., they don't have your authenticator app) — *provided the seed slot is protected by something they lack*. If both HSM slots are gated by the same biometric, an attacker past that biometric obtains both `K_hsm` and `S`. To make TOTP resist a post-biometric on-device attacker, the seed slot can optionally require a **distinct PIN** (`totp.seed_pin`, a knowledge factor separate from the master password). This is offered as a setting and its security implication is documented; it is off by default.
+What TOTP buys you: defense against an attacker who has your master password and can drive the HSM but cannot produce a current code (e.g., they don't have your authenticator app) — *provided the seed slot is protected by something they lack*. If both HSM slots are gated by the same biometric, an attacker past that biometric obtains both `K_hsm` and `S`. To make TOTP resist a post-biometric on-device attacker, the seed slot can optionally require a **distinct PIN** (`totp.seed_pin`, a knowledge factor separate from the master password). This is designed as an optional setting, off by default, but it is **not built yet**: `settings.toml` accepts a `totp_seed_pin` key, and nothing reads it, so setting it has no effect (§13).
 
 ---
 
@@ -97,6 +100,8 @@ passman/
 ├── ci/                        # boundary-grep, reproducible-build harness
 └── architecture.md
 ```
+
+This is the design layout. Today's tree differs: there is no `passman-win/` or `ios/`; `packaging/` holds only `passman.desktop`; the boundary checks live in `scripts/check-boundaries.sh` and CI in `.github/workflows/`; and two crates not shown above exist, `passman-platform` (paths and `settings.toml`) and `passman-cli`.
 
 ### 2.2 Dependency graph (one-way, acyclic)
 
@@ -330,9 +335,9 @@ Parsing rules: read exactly `entries_count` envelopes; EOF-before-count or trail
 
 **Mobile default — Low.** The Android front-end defaults vault creation to the **Low** preset (256 MiB / t = 4), labelled "Low (recommended)" in the create screen, because phones cannot spare the 1 GiB the desktop Medium default uses without OOM risk. Desktop (CLI/GTK) still defaults to Medium.
 
-**Anti-DoS ceiling (untrusted-header guard).** Argon2 cost parameters reach `passman-crypto` from attacker-controllable on-disk headers (vault and recovery files), and the `argon2` crate itself caps `m`/`t` only near `u32::MAX`. A hostile header could therefore demand a multi-terabyte allocation or multi-hour derivation **before** authentication can fail — a pre-auth resource-exhaustion DoS (fatal on mobile). `passman-crypto` defines a universal *ceiling* — `MAX_M_KIB = 8 GiB`, `MAX_T = 24`, `MAX_P = 16` — enforced by `KdfParams::within_limits()` at **both** parser boundaries (`vault::from_bytes`, `recovery::import`) and again inside the derivation as a backstop, so no path can run an out-of-range cost. The static ceiling sits at the strongest shipped preset (recovery "Paranoid" = 8 GiB / t = 12), so every shipped configuration is *structurally* admitted. This is a **ceiling**, not a floor: the per-context strength *floor* (the recovery export floor in §7.4) is a separate, export-side caller policy.
+**Anti-DoS ceiling (untrusted-header guard).** Argon2 cost parameters reach `passman-crypto` from attacker-controllable on-disk headers (vault and recovery files), and the `argon2` crate itself caps `m`/`t` only near `u32::MAX`. A hostile header could therefore demand a multi-terabyte allocation or multi-hour derivation **before** authentication can fail — a pre-auth resource-exhaustion DoS (fatal on mobile). `passman-crypto` defines a universal *ceiling* — `MAX_M_KIB = 8 GiB`, `MAX_T = 24`, `MAX_P = 16` — enforced by `KdfParams::within_limits()` before any derivation — in `recovery::import` for recovery files, and for the vault in `passman-core`'s unlock (`app.rs`), right after `Vault::from_bytes` parses the header (the vault parser itself does not check it) — and again inside the derivation as a backstop, so no path can run an out-of-range cost. The static ceiling sits at the strongest shipped preset (recovery "Paranoid" = 8 GiB / t = 12), so every shipped configuration is *structurally* admitted. This is a **ceiling**, not a floor: the per-context strength *floor* (the recovery export floor in §7.4) is a separate, export-side caller policy.
 
-The static ceiling alone does **not** prevent the DoS, and a real-hardware attack campaign confirmed this: reproducing an Argon2 hash inherently needs its full memory cost, and `MAX_M_KIB` (8 GiB) exceeds the RAM of every phone and many desktops, so an in-range-but-too-large `m` still OOM-kills (or `handle_alloc_error`-aborts) the process pre-auth — even a *legitimate* high-preset recovery file does this on a constrained device. `argon2id` therefore applies a second, **host-aware** check: before allocating, it refuses any derivation whose memory cost exceeds ~80% of the running machine's available RAM (Linux/Android via `/proc/meminfo` `MemAvailable`; static ceiling only where that is unknowable), returning a clean typed `CryptoError::Kdf` instead of crashing. A direct consequence is that **a recovery file created at a high preset must be *restored* on a machine with comparable RAM** — this is intrinsic to Argon2 (a 4 GiB-cost file cannot be re-derived with less than 4 GiB), not a defect; the host-aware check makes the constraint fail cleanly with an actionable message rather than killing the importer.
+The static ceiling alone does **not** prevent the DoS, and a real-hardware attack campaign confirmed this: reproducing an Argon2 hash inherently needs its full memory cost, and `MAX_M_KIB` (8 GiB) exceeds the RAM of every phone and many desktops, so an in-range-but-too-large `m` still OOM-kills (or `handle_alloc_error`-aborts) the process pre-auth — even a *legitimate* high-preset recovery file does this on a constrained device. Every derivation therefore applies a second, **host-aware** check: `passman-core` reads the machine's available RAM (`MemAvailable` from `/proc/meminfo` on Linux/Android) and passes it to `passman-crypto` (`argon2id_within_memory`, and the recovery crate's `export_within_memory`/`import_within_memory`), which, before allocating, refuses any derivation whose memory cost exceeds ~80% of it, returning a clean typed `CryptoError::Kdf` instead of crashing. The crypto and recovery crates do no I/O, so they cannot read the figure themselves; where it cannot be read, only the static ceiling applies. A direct consequence is that **a recovery file created at a high preset must be *restored* on a machine with comparable RAM** — this is intrinsic to Argon2 (a 4 GiB-cost file cannot be re-derived with less than 4 GiB), not a defect; the host-aware check makes the constraint fail cleanly with an actionable message rather than killing the importer.
 
 ### 4.9 Lockout: HSM-native primary, app-timer advisory
 
@@ -785,7 +790,7 @@ No auto-update. The default binary makes **no network connections, ever**. An op
 | 30 | CI compromise signs release | Critical | Air-gapped manual signing; CI cannot sign |
 | 31 | Network egress leaks metadata | Medium | Network-silent default binary; update-check opt-in |
 | 32 | Concurrent-instance race clobbers vault | Medium | Single-instance advisory lock on vault path |
-| 33 | TOTP seed free-rides on vault-key unwrap | Medium | Seed in an independent HSM slot; optional distinct seed PIN for post-biometric independence |
+| 33 | TOTP seed free-rides on vault-key unwrap | Medium | Seed in an independent HSM slot; optional distinct seed PIN for post-biometric independence (PIN not built yet, §13) |
 
 ---
 
@@ -829,7 +834,7 @@ No auto-update. The default binary makes **no network connections, ever**. An op
 - **iOS:** full Secure Enclave implementation and SwiftUI front-end (designed for, deferred).
 - **Windows native UI:** v0 uses `egui`; a native WinUI/`windows-rs` front-end is a later improvement.
 - **`cargo vet` gating:** advisory in v0, hard gate later.
-- **Distinct TOTP-seed PIN (§1.6):** ships as an optional setting; default off. Revisit whether it should be encouraged for high-value vaults.
+- **Distinct TOTP-seed PIN (§1.6):** not built. `settings.toml` accepts a `totp_seed_pin` key (default off), but nothing reads it, so it has no effect. Building it means gating the seed slot behind its own PIN on each backend; then revisit whether it should be encouraged for high-value vaults.
 - **Browser/autofill integration:** out of scope for v0.
 - **Fully-reproducible packaging:** `.deb`/`.apk`/`.exe` reproducibility is a stretch goal beyond the core-binary guarantee.
 
