@@ -1,0 +1,10 @@
+# UniFFI bindgen settings for this crate. In library mode
+# (`uniffi-bindgen generate --library …`) the bindgen reads this file from the
+# crate root.
+[bindings.kotlin]
+# Use the Android cleaner in the generated Kotlin. The default (JVM) cleaner
+# calls `java.lang.ref.Cleaner`, which needs API 33, while the app's minSdk is
+# 30, so Android lint fails with NewApi. The Android cleaner uses
+# `android.system.SystemCleaner` only on API 34+ (behind a version check) and
+# the JNA cleaner below that.
+android_cleaner = true
