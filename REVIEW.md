@@ -69,9 +69,9 @@ sound); `estimate_master` user-inputs (works as designed); detached-worker
 
 ## Remediation status
 
-The review's blockers and high/medium findings are being addressed on branch
-**`fix/full-remediation`**, organized into the sector passes below. Summary of the
-landed commits (`git log cee7f55..HEAD`):
+The review's blockers and high/medium findings were addressed in the sector
+passes below. The work was done on a branch named `fix/full-remediation`, which
+became `main` on 2026-06-29. Summary of the commits (`git log cee7f55..6bef115`):
 
 | Commit | Sector | What landed |
 |--------|--------|-------------|
@@ -82,14 +82,18 @@ landed commits (`git log cee7f55..HEAD`):
 | `abc580e` | Sec 3 | CLI interrupt-safe clipboard, `0600` recovery export, distinct exit codes, non-blocking lock (**B3** CLI side). |
 | `da5accd` | Sec 3 | GTK: clear add-form, surface dead-channel, Enter-to-submit, accessibility, UX. |
 | `b86f8a9` | Sec 3 | Android: off-main-thread lock/open (**B3**), scrub-on-throw (**B6**), mobile KDF default, QR, UX. |
+| `f53ec58`, `6be821e`, `5b9e9b0` | B7/B8 | Recovery-backup export, onboarding nudge, and TOTP confirm in core, GTK, and Android (**B7**, **B8**). |
+| `bc15f06` | A12 | Refuse an Argon2 cost above 80% of the host's available RAM (follow-up to **B1**, see `ATTACK-REPORT.md`). |
 
 Status by blocker:
 
 - **B1, B2** — fixed (`6f8e126`); anti-DoS KDF ceiling enforced at both parser
   boundaries (see `architecture.md` §4.8).
 - **B3** — fixed across CLI/Android/UniFFI (`abc580e`, `b86f8a9`).
-- **B4** — fixed (`39742a3`): Android cross-compile, UniFFI bindgen check,
-  `assembleDebug` + lint, and an emulator instrumented-test lane.
+- **B4** — CI config added (`39742a3`): Android cross-compile, UniFFI bindgen
+  check, `assembleDebug` + lint, and an emulator instrumented-test lane. No CI
+  run had passed as of 2026-10. In the last runs the boundary check, the
+  `lintDebug` step, and both fuzz steps failed.
 - **B5** — in progress: a tag-triggered build/checksum/SBOM skeleton now exists
   (`.github/workflows/release.yml`), and the docs are reconciled to mark
   verification "planned — no signed release published yet". Generating and
@@ -97,9 +101,12 @@ Status by blocker:
 - **B6** — addressed where feasible (`612ea2a`, `b86f8a9`); genuinely
   unavoidable JVM/FFI residuals are documented as accepted rather than claimed
   scrubbed.
-- **B7, B8** (UX) — GTK/Android UX work landed in `da5accd` / `b86f8a9`; full
-  recovery-backup UI and a TOTP-confirm-at-creation step across all frontends
-  remain tracked follow-ups.
+- **B7** (UX) — partly done (`f53ec58`, `6be821e`, `5b9e9b0`): GTK and Android
+  can create a recovery backup, and onboarding asks the user to make one.
+  Restoring a backup still works only from the CLI (`passman import`); GTK and
+  Android have no restore screen yet.
+- **B8** (UX) — done (same commits): GTK and Android ask for a fresh TOTP code
+  right after a vault is created, to confirm the authenticator was set up.
 
 Docs (this pass) have been reconciled to the actual code: `architecture.md`
 §9.4/§9.5, `README.md`, and `docs/RELEASE.md` no longer over-promise on
