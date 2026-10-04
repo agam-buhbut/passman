@@ -61,7 +61,8 @@ impl StrengthTier {
     /// Whether a vault with a master password of this tier may create a
     /// single-factor recovery export (`architecture.md` §7.5): Strong or above
     /// (`>= 55` zxcvbn-bits). Safe at this threshold because the export sits
-    /// behind the 4 GiB Argon2id of §7.4 — see [`estimate_master`].
+    /// behind the recovery Argon2id of §7.4 (1 GiB / 4 passes by default) —
+    /// see [`estimate_master`].
     #[must_use]
     pub fn allows_export(self) -> bool {
         matches!(self, StrengthTier::Strong | StrengthTier::Excellent)
@@ -222,7 +223,8 @@ fn collect_feedback(entropy: &zxcvbn::Entropy) -> Vec<String> {
 /// range: [`StrengthTier::Excellent`] begins at 62 bits (the cap region) and
 /// the export gate ([`StrengthTier::allows_export`], §7.5) requires
 /// [`StrengthTier::Strong`] at `>= 55` bits — reachable by a strong passphrase
-/// and safe because the recovery export sits behind the 4 GiB Argon2id of §7.4.
+/// and safe because the recovery export sits behind the recovery Argon2id of
+/// §7.4 (1 GiB / 4 passes by default, 4 or 8 GiB if the user picks it).
 /// Generated passwords are scored by [`generated_entropy_bits`] instead
 /// (uncapped, ~262 bits for the default policy), so they clear any gate.
 ///

@@ -366,15 +366,25 @@ fn default_recovery_filename() -> &'static str {
     "passman-recovery.pmrec"
 }
 
+/// The recovery-export dropdown labels, in [`preset_from_index`] order:
+/// Floor, Default, Paranoid. A restore needs the file's Argon2 memory plus the
+/// 20% headroom `passman-crypto` keeps free, hence about 1.25, 5 and 10 GB.
+const RECOVERY_PRESET_LABELS: [&str; 3] = [
+    "1 GB — fits most phones (default)",
+    "4 GB — restore needs about 5 GB free memory",
+    "8 GB — restore needs about 10 GB free memory",
+];
+
 /// Map a recovery-preset dropdown index to a [`RecoveryPreset`] (B7).
 ///
-/// The dropdown is built as `["Floor", "Default", "Paranoid"]`; any unexpected
-/// index falls back to `Default` (the dropdown's own default selection).
+/// The dropdown lists [`RECOVERY_PRESET_LABELS`]: 1 GB (Floor), 4 GB (Default)
+/// and 8 GB (Paranoid). Any unexpected index falls back to `Floor`, the
+/// dropdown's own default selection.
 fn preset_from_index(index: u32) -> RecoveryPreset {
     match index {
-        0 => RecoveryPreset::Floor,
+        1 => RecoveryPreset::Default,
         2 => RecoveryPreset::Paranoid,
-        _ => RecoveryPreset::Default,
+        _ => RecoveryPreset::Floor,
     }
 }
 
@@ -989,8 +999,8 @@ fn open_export_dialog(ui: &Rc<Ui>) {
         .build();
     code.update_property(&[gtk::accessible::Property::Label("Fresh TOTP code")]);
 
-    let preset = gtk::DropDown::from_strings(&["Floor", "Default", "Paranoid"]);
-    preset.set_selected(1); // Default — matches preset_from_index's fallback.
+    let preset = gtk::DropDown::from_strings(&RECOVERY_PRESET_LABELS);
+    preset.set_selected(0); // 1 GB (Floor) — matches preset_from_index's fallback.
     let preset_row = gtk::Box::new(Orientation::Horizontal, 6);
     preset_row.append(&gtk::Label::new(Some("Strength:")));
     preset_row.append(&preset);
@@ -1454,15 +1464,16 @@ mod tests {
 
     #[test]
     fn preset_from_index_maps_the_dropdown_order() {
-        // The dropdown is ["Floor", "Default", "Paranoid"]; out-of-range falls
-        // back to Default (the dropdown's own initial selection) (B7).
+        // The dropdown is 1 GB, 4 GB, 8 GB (Floor, Default, Paranoid);
+        // out-of-range falls back to Floor (the dropdown's own initial
+        // selection) (B7).
         assert_eq!(preset_from_index(0), RecoveryPreset::Floor);
         assert_eq!(preset_from_index(1), RecoveryPreset::Default);
         assert_eq!(preset_from_index(2), RecoveryPreset::Paranoid);
-        assert_eq!(preset_from_index(99), RecoveryPreset::Default);
+        assert_eq!(preset_from_index(99), RecoveryPreset::Floor);
         // GTK's "no selection" sentinel (INVALID_LIST_POSITION == u32::MAX) must
         // not panic and must stay safe.
-        assert_eq!(preset_from_index(u32::MAX), RecoveryPreset::Default);
+        assert_eq!(preset_from_index(u32::MAX), RecoveryPreset::Floor);
     }
 
     #[test]

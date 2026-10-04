@@ -656,7 +656,7 @@ private fun ExportRecoveryDialog(
 ) {
     var master by remember { mutableStateOf("") }
     var code by remember { mutableStateOf("") }
-    var preset by remember { mutableStateOf(RecoveryChoice.DEFAULT) }
+    var preset by remember { mutableStateOf(RecoveryChoice.FLOOR) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -691,10 +691,21 @@ private fun ExportRecoveryDialog(
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 )
                 Text("Backup strength", style = MaterialTheme.typography.labelLarge)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    KdfOption("Floor", preset == RecoveryChoice.FLOOR) { preset = RecoveryChoice.FLOOR }
-                    KdfOption("Default", preset == RecoveryChoice.DEFAULT) { preset = RecoveryChoice.DEFAULT }
-                    KdfOption("Paranoid", preset == RecoveryChoice.PARANOID) { preset = RecoveryChoice.PARANOID }
+                // Stacked: each label says how much free memory a restore needs
+                // (the file's Argon2 memory plus 20% headroom).
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    KdfOption(
+                        "1 GB — fits most phones (default)",
+                        preset == RecoveryChoice.FLOOR,
+                    ) { preset = RecoveryChoice.FLOOR }
+                    KdfOption(
+                        "4 GB — restore needs about 5 GB free memory",
+                        preset == RecoveryChoice.DEFAULT,
+                    ) { preset = RecoveryChoice.DEFAULT }
+                    KdfOption(
+                        "8 GB — restore needs about 10 GB free memory",
+                        preset == RecoveryChoice.PARANOID,
+                    ) { preset = RecoveryChoice.PARANOID }
                 }
                 if (inFlight) {
                     CircularProgressIndicator()

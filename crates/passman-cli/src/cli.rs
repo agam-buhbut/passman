@@ -91,8 +91,9 @@ pub enum Command {
     Export {
         /// Output file path.
         file: PathBuf,
-        /// Backup strength (higher = slower to open, harder to crack).
-        #[arg(long, value_enum, default_value_t = RecPreset::Default)]
+        /// Backup size: 1gb (default), 4gb or 8gb. Bigger is harder to crack,
+        /// but restoring needs more free memory: about 1.25 GB, 5 GB or 10 GB.
+        #[arg(long, value_enum, default_value_t = RecPreset::Floor)]
         preset: RecPreset,
     },
 
@@ -136,14 +137,20 @@ impl Preset {
     }
 }
 
-/// Recovery export Argon2id preset (`architecture.md` §7.4).
+/// Recovery export Argon2id preset (`architecture.md` §7.4), named on the
+/// command line by its memory size. The old names `floor`, `default` and
+/// `paranoid` still work as hidden aliases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum RecPreset {
-    /// 1 GiB / t=4 — the minimum the format permits.
+    /// 1 GiB, 4 passes (the default, and the minimum allowed). Restoring needs
+    /// about 1.25 GB of free memory, which most phones have.
+    #[value(name = "1gb", alias = "floor")]
     Floor,
-    /// 4 GiB / t=8 — the default.
+    /// 4 GiB, 8 passes. Restoring needs about 5 GB of free memory.
+    #[value(name = "4gb", alias = "default")]
     Default,
-    /// 8 GiB / t=12.
+    /// 8 GiB, 12 passes. Restoring needs about 10 GB of free memory.
+    #[value(name = "8gb", alias = "paranoid")]
     Paranoid,
 }
 
@@ -206,15 +213,14 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn export_defaults_to_the_strong_preset_not_the_floor() {
-        // The recovery export's password-only KDF is the dominant residual risk
-        // (architecture.md §3.4 / §11 #19), which the threat model sizes at the
-        // 4 GiB/8 Default preset — the §8.4 weak-export argument depends on it.
-        // A plain `passman export <file>` must therefore NOT fall back to the
-        // 1 GiB/4 Floor.
+    fn export_defaults_to_the_floor_preset() {
+        // A plain `passman export <file>` uses the 1 GiB/4 Floor so the backup
+        // can be restored on a phone or a small laptop: restoring needs the
+        // file's full Argon2 memory. The §8.4 export-gate argument is sized for
+        // this cost. Stronger presets stay one flag away (`--preset`).
         let cli = Cli::try_parse_from(["passman", "export", "backup.pmr"]).expect("parse");
         match cli.command {
-            Command::Export { preset, .. } => assert_eq!(preset, RecPreset::Default),
+            Command::Export { preset, .. } => assert_eq!(preset, RecPreset::Floor),
             other => panic!("expected Export, got {other:?}"),
         }
     }

@@ -23,17 +23,20 @@ pub const RECOVERY_INFO: &[u8] = b"recovery-export-v0";
 /// GPU/ASIC barrier and raising parallelism mostly helps the attacker too.
 ///
 /// Note: *restoring* a recovery file re-runs Argon2id at the file's own memory
-/// cost (`passman_crypto::argon2id_within_memory` refuses costs that exceed the
-/// host's RAM), so a file created at a high preset must be restored on a
-/// machine with comparable RAM (Default ≈ ≥5 GiB, Paranoid ≈ ≥9 GiB). Choose
-/// `Floor` if the backup must be restorable on a constrained/mobile device.
+/// cost, and `passman_crypto::argon2id_within_memory` refuses a cost above 80%
+/// of the host's available RAM. So a restore needs about 1.25x the preset's
+/// memory free: about 1.25 GiB for Floor, 5 GiB for Default and 10 GiB for
+/// Paranoid. The shells default to `Floor` so a default backup fits the memory
+/// of most phones and small laptops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryPreset {
-    /// Floor: 1 GiB, t = 4, p = 1 (~2.5 s). `export` refuses anything weaker.
+    /// Floor: 1 GiB, t = 4, p = 1 (~2.5 s). The shells' default (shown as
+    /// "1 GB"); `export` refuses anything weaker.
     Floor,
-    /// Default: 4 GiB, t = 8, p = 1 (~15 s).
+    /// Default: 4 GiB, t = 8, p = 1 (~15 s). Shown as "4 GB". The name is
+    /// historical: it is no longer the default.
     Default,
-    /// Paranoid: 8 GiB, t = 12, p = 1 (~45 s).
+    /// Paranoid: 8 GiB, t = 12, p = 1 (~45 s). Shown as "8 GB".
     Paranoid,
 }
 

@@ -334,14 +334,17 @@ impl KdfChoice {
 }
 
 /// Recovery-export Argon2id cost preset (§7.4), mirrored for Kotlin. Maps to the
-/// core/recovery [`RecoveryPreset`] (mirrors the [`KdfChoice`] pattern).
+/// core/recovery [`RecoveryPreset`] (mirrors the [`KdfChoice`] pattern). The UI
+/// shows these by size: 1 GB, 4 GB, 8 GB.
 #[derive(Debug, Clone, Copy, uniffi::Enum)]
 pub enum RecoveryChoice {
-    /// 1 GiB / t=4 — the minimum the recovery format permits.
+    /// 1 GiB / t=4 — the default, and the minimum the recovery format permits.
+    /// Restoring needs about 1.25 GB of free memory.
     Floor,
-    /// 4 GiB / t=8 — the default.
+    /// 4 GiB / t=8 (the name is historical; it is no longer the default).
+    /// Restoring needs about 5 GB of free memory.
     Default,
-    /// 8 GiB / t=12.
+    /// 8 GiB / t=12. Restoring needs about 10 GB of free memory.
     Paranoid,
 }
 
