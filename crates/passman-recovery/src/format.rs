@@ -64,6 +64,9 @@ const HEADER_LEN: usize = 6 + 1 + 1 + 4 + 4 + 1 + SALT_LEN + aead::NONCE_LEN + 4
 /// owned by `passman-core`, not here — recovery does not depend on
 /// `passman-policy`. This function enforces only the Argon2 Floor.
 ///
+/// This entry point skips the host-memory check, because this crate cannot
+/// measure memory; `passman-core` calls [`export_within_memory`] instead.
+///
 /// # Errors
 ///
 /// - [`RecoveryError::WeakParams`] if `recovery_params` are below the Floor.
@@ -73,6 +76,23 @@ pub fn export(
     payload: &ExportPayload,
     password: &SecretString,
     recovery_params: &KdfParams,
+) -> Result<Vec<u8>, RecoveryError> {
+    export_within_memory(payload, password, recovery_params, None)
+}
+
+/// [`export`] plus the host-memory check: `available_kib` is the host's
+/// available memory in KiB, measured by the caller (`None` = unknown, check
+/// skipped). See [`passman_crypto::argon2id_within_memory`].
+///
+/// # Errors
+///
+/// As [`export`]; a recovery cost too large for `available_kib` is a
+/// [`RecoveryError::Crypto`].
+pub fn export_within_memory(
+    payload: &ExportPayload,
+    password: &SecretString,
+    recovery_params: &KdfParams,
+    available_kib: Option<u64>,
 ) -> Result<Vec<u8>, RecoveryError> {
     if !meets_floor(recovery_params) {
         return Err(RecoveryError::WeakParams {
@@ -84,7 +104,7 @@ pub fn export(
             floor_p: FLOOR_PARAMS.p,
         });
     }
-    export_with(payload, password, recovery_params)
+    seal(payload, password, recovery_params, available_kib)
 }
 
 /// The export work without the Floor gate.
@@ -102,6 +122,17 @@ pub(crate) fn export_with(
     password: &SecretString,
     recovery_params: &KdfParams,
 ) -> Result<Vec<u8>, RecoveryError> {
+    seal(payload, password, recovery_params, None)
+}
+
+/// The shared export body: salt, nonce, payload encoding, key derivation, and
+/// AEAD sealing, with no Floor gate.
+fn seal(
+    payload: &ExportPayload,
+    password: &SecretString,
+    recovery_params: &KdfParams,
+    available_kib: Option<u64>,
+) -> Result<Vec<u8>, RecoveryError> {
     // Salt is not secret, but it must come from the CSPRNG; fill a plain array.
     let mut recovery_salt = [0u8; SALT_LEN];
     fill_random(&mut recovery_salt);
@@ -110,7 +141,7 @@ pub(crate) fn export_with(
     // Hand-encode into a zeroizing buffer; scrubbed on drop after encryption.
     let plaintext = encode_payload(payload);
 
-    let k_recovery = derive_recovery_key(password, &recovery_salt, recovery_params)?;
+    let k_recovery = derive_recovery_key(password, &recovery_salt, recovery_params, available_kib)?;
     let ciphertext = aead::encrypt(&k_recovery, &nonce, RECOVERY_AD, plaintext.expose())?;
 
     // payload_ct_len: the AEAD output (ct ‖ tag) length. It cannot exceed
@@ -179,7 +210,26 @@ pub fn export_unchecked(
 /// - [`RecoveryError::Decrypt`] for a wrong password or tampered input.
 /// - [`RecoveryError::MalformedPayload`] for a structurally bad decrypted
 ///   payload.
+///
+/// This entry point skips the host-memory check, because this crate cannot
+/// measure memory; `passman-core` calls [`import_within_memory`] instead.
 pub fn import(file_bytes: &[u8], password: &SecretString) -> Result<ExportPayload, RecoveryError> {
+    import_within_memory(file_bytes, password, None)
+}
+
+/// [`import`] plus the host-memory check: `available_kib` is the host's
+/// available memory in KiB, measured by the caller (`None` = unknown, check
+/// skipped). See [`passman_crypto::argon2id_within_memory`].
+///
+/// # Errors
+///
+/// As [`import`]; a header cost too large for `available_kib` is a
+/// [`RecoveryError::Crypto`], returned before any allocation.
+pub fn import_within_memory(
+    file_bytes: &[u8],
+    password: &SecretString,
+    available_kib: Option<u64>,
+) -> Result<ExportPayload, RecoveryError> {
     let mut r = Reader::new(file_bytes);
 
     let magic = r.take_array::<6>("magic")?;
@@ -231,7 +281,8 @@ pub fn import(file_bytes: &[u8], password: &SecretString) -> Result<ExportPayloa
         return Err(RecoveryError::Decrypt);
     }
 
-    let k_recovery = derive_recovery_key(password, &recovery_salt, &recovery_params)?;
+    let k_recovery =
+        derive_recovery_key(password, &recovery_salt, &recovery_params, available_kib)?;
 
     // Map AEAD authentication failure to the detail-free `Decrypt` (no oracle).
     // A non-auth crypto error (none is expected on this path) still propagates

@@ -16,7 +16,7 @@ use passman_policy::{
     classify, estimate_master, generate, EntryPolicy, GenerationRequest, MasterEntropy,
     StrengthTier,
 };
-use passman_recovery::{export, ExportPayload, RecoveryEntry, RecoveryPreset};
+use passman_recovery::{export_within_memory, ExportPayload, RecoveryEntry, RecoveryPreset};
 use passman_vault::{EntryId, EntryRecord, Index, IndexEntry, Vault};
 
 use crate::app::{App, KEY_LEN};
@@ -413,8 +413,9 @@ impl<'a, H: passman_hsm::HardwareKeyStore> UnlockedApp<'a, H> {
     /// the session token (so malware holding a session cannot export). Then
     /// decrypts every entry, translates [`EntryPolicy`] to postcard bytes for
     /// the [`RecoveryEntry`], assembles the [`ExportPayload`] (carrying the TOTP
-    /// seed and the original vault KDF), and calls [`passman_recovery::export`]
-    /// with the chosen preset. Returns the file bytes for the shell to write.
+    /// seed and the original vault KDF), and calls
+    /// [`passman_recovery::export_within_memory`] with the chosen preset and the
+    /// host's available memory. Returns the file bytes for the shell to write.
     ///
     /// On success the vault's `last_export_at` metadata is updated and
     /// persisted.
@@ -493,7 +494,12 @@ impl<'a, H: passman_hsm::HardwareKeyStore> UnlockedApp<'a, H> {
             entries,
         };
 
-        let file = export(&payload, master_for_reauth, &recovery_preset.params())?;
+        let file = export_within_memory(
+            &payload,
+            master_for_reauth,
+            &recovery_preset.params(),
+            crate::app::available_memory_kib(),
+        )?;
 
         // Record last_export_at and persist.
         let mut vault = vault;

@@ -33,7 +33,7 @@ pub mod secret;
 pub use ct::ct_eq;
 pub use derive::{hkdf_expand, hkdf_master};
 pub use error::CryptoError;
-pub use kdf::{argon2id, KdfParams, KDF_PARAMS_LEN};
+pub use kdf::{argon2id, argon2id_within_memory, KdfParams, KDF_PARAMS_LEN};
 pub use key::{EntryKey, MasterKey};
 pub use rng::{fill_random, random_nonce, random_secret};
 pub use secret::{SecretArray, SecretBytes, SecretString};

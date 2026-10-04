@@ -31,10 +31,11 @@ const DERIVED_KEY_LEN: usize = 32;
 /// Argon2 hash inherently requires its full memory cost, and 8 GiB exceeds the
 /// RAM of most mobile devices and many desktops, so an in-range-but-too-large
 /// `m` still OOM-kills (or `handle_alloc_error`-aborts) the process pre-auth.
-/// [`argon2id`] therefore applies an additional **host-aware** check that
-/// refuses any derivation whose memory cost would not fit this machine, *before*
-/// the allocation. A per-context *strength floor* (e.g. the recovery Floor) is a
-/// separate caller policy.
+/// [`argon2id_within_memory`] therefore applies an additional **host-aware**
+/// check: given the host's available memory (measured by the caller, since this
+/// crate does no I/O), it refuses any derivation whose memory cost would not
+/// fit, *before* the allocation. A per-context *strength floor* (e.g. the
+/// recovery Floor) is a separate caller policy.
 pub const MAX_M_KIB: u32 = 8 * 1024 * 1024;
 
 /// Maximum accepted Argon2id time cost (passes). See [`MAX_M_KIB`].
@@ -143,30 +144,33 @@ fn memory_cost_fits(m_kib: u32, available_kib: u64) -> bool {
     u64::from(m_kib) <= available_kib / 5 * 4
 }
 
-/// Best-effort currently-available system memory in KiB, or `None` when it
-/// cannot be determined (non-Linux targets, or `/proc/meminfo` unreadable). A
-/// `None` result means the host-aware check is skipped and only the static
-/// [`MAX_M_KIB`] ceiling applies.
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn available_memory_kib() -> Option<u64> {
-    // `MemAvailable` (kernel >= 3.14) is the right metric: it estimates RAM
-    // obtainable without swapping, accounting for reclaimable cache. The value
-    // is already in KiB (the trailing "kB" is a misnomer for KiB by convention).
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            return rest.split_whitespace().next()?.parse::<u64>().ok();
-        }
-    }
-    None
+/// Derive a 256-bit key from `password` and `salt` using Argon2id (v1.3),
+/// **without** the host-memory check.
+///
+/// Same as [`argon2id_within_memory`] with `available_kib = None`: only the
+/// static ceiling ([`KdfParams::within_limits`]) applies. Code that derives
+/// from untrusted header parameters should measure the host's memory and call
+/// [`argon2id_within_memory`] instead (`passman-core` does this for every
+/// derivation).
+///
+/// # Errors
+///
+/// As [`argon2id_within_memory`], minus the host-memory refusal.
+pub fn argon2id(
+    password: &SecretString,
+    salt: &[u8],
+    params: &KdfParams,
+) -> Result<SecretArray<32>, CryptoError> {
+    argon2id_within_memory(password, salt, params, None)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn available_memory_kib() -> Option<u64> {
-    None
-}
-
-/// Derive a 256-bit key from `password` and `salt` using Argon2id (v1.3).
+/// Derive a 256-bit key from `password` and `salt` using Argon2id (v1.3),
+/// refusing a memory cost that does not fit `available_kib`.
+///
+/// `available_kib` is the host's currently available memory in KiB, measured by
+/// the caller (this crate does no I/O). `None` means it is unknown: the
+/// host-memory check is then skipped and only the static [`MAX_M_KIB`] ceiling
+/// applies.
 ///
 /// The output is written straight into a zeroizing [`SecretArray<32>`]; no
 /// plaintext-key copy outlives this function.
@@ -175,13 +179,14 @@ fn available_memory_kib() -> Option<u64> {
 ///
 /// Returns [`CryptoError::Kdf`] if the parameters are structurally invalid
 /// (e.g. memory cost below the algorithm minimum), if the requested memory cost
-/// would exceed this host's available RAM (a pre-auth resource-exhaustion
-/// guard — see [`MAX_M_KIB`]), or if the derivation itself fails. The error
-/// message never contains the password.
-pub fn argon2id(
+/// would exceed 80% of `available_kib` (a pre-auth resource-exhaustion guard —
+/// see [`MAX_M_KIB`]), or if the derivation itself fails. The error message
+/// never contains the password.
+pub fn argon2id_within_memory(
     password: &SecretString,
     salt: &[u8],
     params: &KdfParams,
+    available_kib: Option<u64>,
 ) -> Result<SecretArray<32>, CryptoError> {
     // Backstop the universal anti-DoS ceiling here so NO derivation path can run
     // with out-of-range cost, even if a caller forgets the early check. The
@@ -196,8 +201,9 @@ pub fn argon2id(
     // (a tampered header, or a legitimate file created on a larger device), and
     // the `argon2` crate aborts via `handle_alloc_error` / the OS OOM-kills the
     // process — a pre-auth `DoS` the static ceiling cannot catch. Refuse cleanly
-    // *before* allocating. Skipped only when available memory is unknowable.
-    if let Some(available_kib) = available_memory_kib() {
+    // *before* allocating. Skipped only when the caller could not measure
+    // available memory.
+    if let Some(available_kib) = available_kib {
         if !memory_cost_fits(params.m_kib, available_kib) {
             return Err(CryptoError::Kdf(format!(
                 "Argon2id memory cost ({} KiB) exceeds the safe budget for this host \

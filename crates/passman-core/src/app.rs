@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use passman_crypto::{
-    argon2id, hkdf_master, random_secret, CryptoError, KdfParams, MasterKey, SecretArray,
-    SecretBytes, SecretString,
+    argon2id_within_memory, hkdf_master, random_secret, CryptoError, KdfParams, MasterKey,
+    SecretArray, SecretBytes, SecretString,
 };
 use passman_hsm::{
     BiometricPrompter, HardwareKeyStore, HsmError, HsmKind, HsmLockoutStatus, HsmSlot, WrappedBlob,
@@ -423,7 +423,11 @@ impl<H: HardwareKeyStore> App<H> {
         let _pg = ProgressGuard::start(&self.progress, "Importing recovery");
 
         // Decrypt + parse the recovery payload.
-        let payload = passman_recovery::import(recovery_file, password)?;
+        let payload = passman_recovery::import_within_memory(
+            recovery_file,
+            password,
+            available_memory_kib(),
+        )?;
 
         // Enroll two FRESH slots: a new random K_hsm and the payload's seed S.
         let k_hsm = random_secret::<KEY_LEN>();
@@ -672,14 +676,15 @@ impl<H: HardwareKeyStore> App<H> {
 ///
 /// # Errors
 ///
-/// Propagates an Argon2id parameter error from [`argon2id`].
+/// Propagates an Argon2id error from [`argon2id_within_memory`], including its
+/// refusal of a cost too large for this host's available memory.
 pub(crate) fn derive_master(
     password: &SecretString,
     vault_salt: &[u8; KEY_LEN],
     kdf: &KdfParams,
     k_hsm: &SecretArray<KEY_LEN>,
 ) -> Result<MasterKey, CoreError> {
-    let k_pw = argon2id(password, vault_salt, kdf)?;
+    let k_pw = argon2id_within_memory(password, vault_salt, kdf, available_memory_kib())?;
 
     // Build the IKM = K_pw ‖ K_hsm inside a zeroizing buffer.
     let mut ikm = Vec::with_capacity(k_pw.expose_bytes().len() + k_hsm.expose_bytes().len());
@@ -690,6 +695,27 @@ pub(crate) fn derive_master(
     let k_master = hkdf_master(vault_salt, ikm.expose(), MASTER_INFO);
     // `ikm` and `k_pw` drop here, scrubbing K_pw and the concatenation.
     Ok(MasterKey::new(k_master))
+}
+
+/// The host's currently available memory in KiB, or `None` when it cannot be
+/// read.
+///
+/// Every Argon2id derivation passes this to `passman-crypto`, which refuses a
+/// memory cost above 80% of it before allocating (the A12 pre-auth `DoS`
+/// guard). The crypto crate does no I/O, so the reading happens here. It is
+/// `MemAvailable` from `/proc/meminfo` (Linux and Android, kernel >= 3.14): the
+/// kernel's estimate of memory obtainable without swapping, counting
+/// reclaimable cache, already in KiB (the file's "kB" means KiB). Where that
+/// file does not exist the result is `None` and only the static ceiling
+/// applies.
+pub(crate) fn available_memory_kib() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            return rest.split_whitespace().next()?.parse::<u64>().ok();
+        }
+    }
+    None
 }
 
 /// Variant of [`derive_master`] that accepts `k_hsm` as raw [`SecretBytes`]

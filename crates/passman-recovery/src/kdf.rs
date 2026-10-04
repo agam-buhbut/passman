@@ -6,7 +6,7 @@
 //! module exposes the three presets, the Floor below which `export` refuses,
 //! and the two-step derivation that turns the password into `K_recovery`.
 
-use passman_crypto::{argon2id, hkdf_master, KdfParams, SecretArray, SecretString};
+use passman_crypto::{argon2id_within_memory, hkdf_master, KdfParams, SecretArray, SecretString};
 
 use crate::error::RecoveryError;
 
@@ -23,10 +23,10 @@ pub const RECOVERY_INFO: &[u8] = b"recovery-export-v0";
 /// GPU/ASIC barrier and raising parallelism mostly helps the attacker too.
 ///
 /// Note: *restoring* a recovery file re-runs Argon2id at the file's own memory
-/// cost (`passman_crypto::argon2id` refuses costs that exceed the host's RAM),
-/// so a file created at a high preset must be restored on a machine with
-/// comparable RAM (Default ≈ ≥5 GiB, Paranoid ≈ ≥9 GiB). Choose `Floor` if the
-/// backup must be restorable on a constrained/mobile device.
+/// cost (`passman_crypto::argon2id_within_memory` refuses costs that exceed the
+/// host's RAM), so a file created at a high preset must be restored on a
+/// machine with comparable RAM (Default ≈ ≥5 GiB, Paranoid ≈ ≥9 GiB). Choose
+/// `Floor` if the backup must be restorable on a constrained/mobile device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryPreset {
     /// Floor: 1 GiB, t = 4, p = 1 (~2.5 s). `export` refuses anything weaker.
@@ -99,17 +99,22 @@ pub fn meets_floor(params: &KdfParams) -> bool {
 /// when fed to HKDF as the IKM, so no un-scrubbed copy of the intermediate key
 /// is left behind.
 ///
+/// `available_kib` is the host's available memory as measured by the caller
+/// (`None` = unknown); see [`passman_crypto::argon2id_within_memory`].
+///
 /// # Errors
 ///
 /// Returns [`RecoveryError::Crypto`] if Argon2id rejects `recovery_params` as
-/// structurally invalid (e.g. memory cost below the algorithm minimum). The
-/// error never echoes the password.
+/// structurally invalid (e.g. memory cost below the algorithm minimum) or as
+/// too large for `available_kib`. The error never echoes the password.
 pub(crate) fn derive_recovery_key(
     password: &SecretString,
     recovery_salt: &[u8; 32],
     recovery_params: &KdfParams,
+    available_kib: Option<u64>,
 ) -> Result<SecretArray<32>, RecoveryError> {
-    let k_recovery_pw = argon2id(password, recovery_salt, recovery_params)?;
+    let k_recovery_pw =
+        argon2id_within_memory(password, recovery_salt, recovery_params, available_kib)?;
     // `expose_bytes` borrows the zeroizing buffer; HKDF copies it internally
     // into its own HMAC state, but we never materialize a plaintext copy of the
     // IKM in a non-zeroizing local. `k_recovery_pw` scrubs on drop at end of fn.

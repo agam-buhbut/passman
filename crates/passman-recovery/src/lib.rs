@@ -13,7 +13,9 @@
 //! - [`export`] / [`import`] — the two entry points. `export` seals an
 //!   [`ExportPayload`] into the §7.2 file bytes (refusing Argon2 params below
 //!   the recovery Floor); `import` is a bounds-checked, panic-free parser that
-//!   recovers it.
+//!   recovers it. [`export_within_memory`] / [`import_within_memory`] do the
+//!   same and also refuse an Argon2 cost too large for the host's available
+//!   memory, which the caller measures (this crate does no I/O).
 //! - [`ExportPayload`], [`RecoveryEntry`] — this crate's own DTOs (it never
 //!   references vault types). Secret fields are zeroizing.
 //! - [`RecoveryPreset`] / [`FLOOR_PARAMS`] / [`meets_floor`] — the §7.4 cost
@@ -36,7 +38,8 @@ pub use error::RecoveryError;
 #[cfg(feature = "test-util")]
 pub use format::export_unchecked;
 pub use format::{
-    export, import, FORMAT_VERSION, KDF_ALGORITHM_ARGON2ID, MAGIC, RECOVERY_AD, SALT_LEN,
+    export, export_within_memory, import, import_within_memory, FORMAT_VERSION,
+    KDF_ALGORITHM_ARGON2ID, MAGIC, RECOVERY_AD, SALT_LEN,
 };
 pub use kdf::{meets_floor, RecoveryPreset, FLOOR_PARAMS, RECOVERY_INFO};
 pub use payload::{ExportPayload, RecoveryEntry, ENTRY_ID_LEN, PAYLOAD_VERSION, TOTP_SEED_LEN};
