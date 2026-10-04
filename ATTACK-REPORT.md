@@ -5,7 +5,9 @@
 > (`/proc/meminfo` `MemAvailable` on Linux/Android), returning a clean typed
 > error instead of OOM-killing the process. Live re-test: the 8 GiB tamper went
 > from OOM-kill (rc=137) to a clean rejection in 29 ms; a legitimate 256 MiB
-> derivation is still allowed through. The A4 / A6 PARTIALs remain accepted
+> derivation is still allowed through. (Since 2026-10, `passman-core` reads
+> `MemAvailable` and passes it into `passman-crypto`, which stays free of I/O;
+> the check and its error are unchanged.) The A4 / A6 PARTIALs remain accepted
 > within the documented threat model; the preset/ceiling tuning the report
 > recommends (lowering `MAX_M_KIB` / the default recovery preset) is a
 > security/usability tradeoff deferred to a follow-up decision.
@@ -81,7 +83,7 @@ printf 'any-pw\n' | sg tss -c 'passman --vault-dir $(mktemp -d) import t.pmr --p
 #  -> process OOM-killed (rc 137), ~20s swap thrash, NO typed rejection, no vault written
 #  vs. m = 8388609 (MAX+1) -> clean rc=1 in 0.02s ("Argon2 parameters are out of range")
 ```
-Full scripts: `/tmp/claude-1000/-home-earl-Documents-prog-passman/b7f50f11-438c-4024-b151-323c809362d5/scratchpad/attack/a12_dos_real2.sh` and `a12_dos_4gib.sh`.
+Full scripts: not kept. The two scripts used (`a12_dos_real2.sh`, `a12_dos_4gib.sh`) lived in a temporary folder that has since been deleted. The commands above are enough to reproduce the finding.
 
 **Recommended fix:**
 1. **Clamp the import-side recovery KDF memory to a host-aware budget**, e.g. `m_effective = min(header.m, fraction_of_available_RAM)`, and refuse (typed `KdfParamsOutOfRange`/resource error) when the header demands more than the host can satisfy — *before* the allocation.
