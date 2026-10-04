@@ -78,4 +78,6 @@ say "Done. Next steps:"
 echo "    passman init          # create your vault (prints a one-time TOTP setup link)"
 echo "    passman add github    # add an entry"
 echo "    passman --help        # everything else"
-[ "$cli_only" -eq 0 ] && echo "    passman-gtk           # or launch the desktop app from your applications menu"
+if [ "$cli_only" -eq 0 ]; then
+  echo "    passman-gtk           # or launch the desktop app from your applications menu"
+fi
