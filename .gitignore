@@ -39,6 +39,8 @@ Thumbs.db
 
 # ── Local tool output (e.g. a redirected `cargo check` scratch dir) ────────
 cargocheck.*
+# Agent work notes: kept on local disk, not in git.
+.superpowers/
 /crates/passman-uniffi/bindings/
 /crates/passman-uniffi/jniLibs/
 android/local.properties
