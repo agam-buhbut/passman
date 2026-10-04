@@ -134,11 +134,14 @@ All crates depend on `passman-crypto`. `passman-vault` additionally depends on `
 
 ### 2.4 Enforcement
 
-- `#![forbid(unsafe_code)]` in `crypto`, `vault`, `policy`, `core`, `totp`, `recovery`.
-- `clippy::disallowed_methods` blocks `std::fs`, `std::net`, `std::env` in `crypto`, `vault`, `policy`.
-- `clippy::disallowed_macros` blocks `tracing::*` in `passman-crypto` (zero logging).
-- CI greps for `cfg(target_*)` outside `passman-hsm` and fails the build if found elsewhere.
-- `cargo audit`, `cargo deny`, and the boundary checks gate merges. Binary parsers (`passman-vault`, `passman-recovery`) are fuzzed (`cargo fuzz`) — they are the highest-risk attack surface (parsing attacker-controlled files).
+`scripts/check-boundaries.sh` runs in CI (and locally) and fails on any violation. It uses `cargo metadata` and greps rather than clippy lints, because one workspace `clippy.toml` cannot scope a rule to only some crates. It checks:
+
+- **The dependency graph (§2.2):** each crate's normal dependencies on other passman crates must be in its allowed set. Dev- and build-dependencies are exempt.
+- **Pure crates do no I/O and no logging:** `crypto`, `totp`, `policy`, `vault` and `recovery` may not use `std::fs`, `std::net`, `std::env`, `std::process`, `tracing::` or `log::`, or the print and `dbg!` macros.
+- **No `unsafe`:** `#![forbid(unsafe_code)]` in `crypto`, `totp`, `policy`, `vault`, `recovery`, `core` and `platform`. (`hsm` needs `unsafe` for platform FFI.)
+- **No platform forks outside the shells:** `cfg(target_os / arch / family / env / vendor / pointer_width)` may appear only in `passman-hsm` and the binary shells (`cli`, `gtk`, `uniffi`).
+
+CI also runs `cargo audit` and `cargo deny`, and fuzzes the binary parsers (`passman-vault`, `passman-recovery`) with `cargo fuzz`: they are the highest-risk attack surface, since they parse attacker-controlled files (§9.5).
 
 ### 2.5 Async posture
 
@@ -178,7 +181,7 @@ All crates depend on `passman-crypto`. `passman-vault` additionally depends on `
 
 ### 3.4 Dominant residual risk
 
-Because verifying TOTP requires `S` on-device and because the recovery export is single-factor, the **recovery export is the dominant residual risk**: its security equals master-password strength (hence the Strong-password gate, §7.5). And once an attacker is past the HSM biometric on a stolen device, they hold `K_hsm` (and `S` unless a distinct seed PIN is set), leaving the master password as the effective barrier. These are foregrounded honestly rather than masked by a "three independent factors" claim.
+Because verifying TOTP requires `S` on-device and because the recovery export is single-factor, the **recovery export is the dominant residual risk**: its security equals master-password strength (hence the Strong-password gate, §7.5). And once an attacker is past the HSM biometric on a stolen device, they hold `K_hsm` and `S` (the distinct seed PIN that could keep `S` apart is not built yet, §13), leaving the master password as the effective barrier. These are foregrounded honestly rather than masked by a "three independent factors" claim.
 
 ---
 
@@ -524,9 +527,9 @@ All variable-length names below are length-prefixed (`name_len: u16-LE`) so the 
 UniFFI cannot export generics or an associated `PlatformCtx`. Therefore:
 
 - The `HardwareKeyStore` trait, its associated `PlatformCtx`, and any `App::unlock<H>` generic are **Rust-internal only** and never appear in the UniFFI surface.
-- `passman-uniffi` exposes a **concrete, non-generic** `App` whose methods are monomorphized for the platform the binding is compiled for (`#[cfg(target_os = …)]` selects the concrete `H`: `AndroidKeystore`, etc.).
-- `PlatformCtx` (`HWND`, `&JObject`, `&TctiContext`, `&LAContext`) is **constructed inside the binding crate** from an opaque handle the foreign side passes (e.g. the Android `Activity` reference obtained via JNI). The raw platform handle never crosses the UniFFI boundary as a typed value.
-- Foreign-implemented callbacks (`BiometricPrompter`, `Progress`, `Spawner`) use `#[uniffi::export(with_foreign)]`, return `Result`, and take owned parameters.
+- `passman-uniffi` exposes a **concrete, non-generic** app handle (`PassmanApp`, over `App<AndroidKeyStore>`). It binds only the Android backend today, so it needs no `cfg(target_os)` to pick one.
+- `PlatformCtx` never crosses the UniFFI boundary as a typed value. On Android it is `()`: the Kotlin shim holds the `Activity`/`Context` it needs and drives the biometric prompt itself. (The Windows `HWND` and iOS `&LAContext` forms below are the plan for those platforms.)
+- Foreign-implemented callbacks use `#[uniffi::export(with_foreign)]`, return `Result`, and take owned parameters. Two exist today: `KeystoreBridge` (the Kotlin Keystore shim) and `ClipboardBridge`. `BiometricPrompter`, `Progress` and `Spawner` are not exported: the shim drives its own prompt, the Android app passes no progress sink, and `Spawner` was dropped.
 
 Concrete per-platform `PlatformCtx`:
 
@@ -535,7 +538,7 @@ Concrete per-platform `PlatformCtx`:
 | Linux TPM2 | `()` |
 | Linux SecretService | `()` |
 | Windows | `HWND` |
-| Android | `&JObject` (Activity) |
+| Android | `()` (the Kotlin shim holds the `Activity`) |
 | iOS | `&LAContext` |
 
 The Linux backends take `PlatformCtx = ()`: the desktop shell injects no handle. Each self-manages its own resource — the TPM2 backend opens its own `tss-esapi` `Context` (targeting `/dev/tpmrm0` or a `TCTI` env override) per operation, and the SecretService backend opens its own D-Bus connection per `keyring::Entry` call.
@@ -734,7 +737,7 @@ The CI `build-twice` job checks the repo out twice and compares the two SHA-256 
 
 ### 9.5 Supply-chain CI
 
-`cargo audit` (RUSTSEC) + `cargo deny` (license/banned/duplicates) + boundary greps (§2.4) + parser fuzzing gate merges; the `build-twice` reproducibility job runs on every push (§9.4). Minimal dependency surface — every workspace dependency is justified in [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md); prefer RustCrypto over FFI; review third-party `build.rs`. A CycloneDX SBOM is generated at release time by the `cargo-cyclonedx` step in `.github/workflows/release.yml` and published alongside the artifacts.
+CI (`.github/workflows/ci.yml`) runs on every push and pull request. It checks formatting (`cargo fmt`), lints (`cargo clippy`, pedantic, warnings denied), the boundary script (§2.4), the full test suite, `cargo audit` (RUSTSEC advisories) and `cargo deny` (advisories, licenses, banned crates, sources). It also fuzzes each binary parser for 60 seconds (15 minutes on the nightly schedule), runs the CLI against a software TPM (swtpm), cross-compiles, builds and lints the Android app, runs the instrumented tests on an emulator (advisory only), checks that two builds give the same hash (`build-twice`, §9.4), and checks the Gradle wrapper. Whether a failing job blocks a merge depends on the repository's branch settings. Minimal dependency surface — every workspace dependency is justified in [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md); prefer RustCrypto over FFI; review third-party `build.rs`. A CycloneDX SBOM is generated at release time by the `cargo-cyclonedx` step in `.github/workflows/release.yml` and published alongside the artifacts.
 
 ### 9.6 Update mechanism — network-silent by default
 
