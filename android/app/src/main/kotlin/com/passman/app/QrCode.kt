@@ -6,8 +6,11 @@ import androidx.compose.foundation.Image
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.produceState
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
@@ -46,10 +49,11 @@ private fun qrBitmap(content: String, size: Int): ImageBitmap? {
 @Composable
 fun QrCode(content: String, modifier: Modifier = Modifier, size: Int = 512) {
     // Generate off the main thread: encode + the per-pixel fill is real work and
-    // must not block the frame. produceState holds null until the bitmap is ready
+    // must not block the frame. `image` holds null until the bitmap is ready
     // (or stays null if encoding failed → text fallback below).
-    val image by produceState<ImageBitmap?>(initialValue = null, content, size) {
-        value = withContext(Dispatchers.Default) { qrBitmap(content, size) }
+    var image by remember { mutableStateOf<ImageBitmap?>(null) }
+    LaunchedEffect(content, size) {
+        image = withContext(Dispatchers.Default) { qrBitmap(content, size) }
     }
     val bmp = image
     if (bmp != null) {

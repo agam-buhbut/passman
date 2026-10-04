@@ -408,11 +408,12 @@ private fun GateScreen(
 
     // B8 live strength readout. estimateStrength needs no session and is cheap,
     // but we still keep it off the main thread and debounce rapid keystrokes.
-    val strengthScore by produceState<Int?>(initialValue = null, master) {
-        value = null
-        if (master.isEmpty()) return@produceState
+    var strengthScore by remember { mutableStateOf<Int?>(null) }
+    LaunchedEffect(master) {
+        strengthScore = null
+        if (master.isEmpty()) return@LaunchedEffect
         delay(150)
-        value = withContext(Dispatchers.Default) { estimateStrength(master).toInt() }
+        strengthScore = withContext(Dispatchers.Default) { estimateStrength(master).toInt() }
     }
 
     Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
