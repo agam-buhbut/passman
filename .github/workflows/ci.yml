@@ -52,7 +52,9 @@ jobs:
 
   # §10 / §9.5: parser fuzzing gates merges. A bounded smoke run per top-attack-
   # surface parser, started from the committed seed corpus (fuzz/corpus/<target>);
-  # a crash writes an artifact and fails the job.
+  # a crash writes an artifact and fails the job. The prebuilt cargo-fuzz is a
+  # musl binary and defaults to the musl target, where the sanitizers cannot
+  # build, so every run passes --target x86_64-unknown-linux-gnu.
   fuzz:
     runs-on: ubuntu-24.04
     steps:
@@ -69,9 +71,9 @@ jobs:
           tool: cargo-fuzz@0.13.2
       - uses: Swatinem/rust-cache@v2
       - name: Fuzz the vault parser (smoke, seeded corpus)
-        run: cd crates/passman-vault && cargo +nightly fuzz run vault_parse fuzz/corpus/vault_parse -- -max_total_time=60 -rss_limit_mb=2048 -timeout=10
+        run: cd crates/passman-vault && cargo +nightly fuzz run --target x86_64-unknown-linux-gnu vault_parse fuzz/corpus/vault_parse -- -max_total_time=60 -rss_limit_mb=2048 -timeout=10
       - name: Fuzz the recovery parser (smoke, seeded corpus)
-        run: cd crates/passman-recovery && cargo +nightly fuzz run recovery_import fuzz/corpus/recovery_import -- -max_total_time=60 -rss_limit_mb=2048 -timeout=10
+        run: cd crates/passman-recovery && cargo +nightly fuzz run --target x86_64-unknown-linux-gnu recovery_import fuzz/corpus/recovery_import -- -max_total_time=60 -rss_limit_mb=2048 -timeout=10
 
   # Medium/prod: a longer, NON-BLOCKING fuzz lane on the nightly schedule. The PR
   # gate stays the fast 60s `fuzz` job above; this one explores deeper from the
@@ -95,9 +97,9 @@ jobs:
           tool: cargo-fuzz@0.13.2
       - uses: Swatinem/rust-cache@v2
       - name: Fuzz the vault parser (extended)
-        run: cd crates/passman-vault && cargo +nightly fuzz run vault_parse fuzz/corpus/vault_parse -- -max_total_time=900 -rss_limit_mb=2048 -timeout=10
+        run: cd crates/passman-vault && cargo +nightly fuzz run --target x86_64-unknown-linux-gnu vault_parse fuzz/corpus/vault_parse -- -max_total_time=900 -rss_limit_mb=2048 -timeout=10
       - name: Fuzz the recovery parser (extended)
-        run: cd crates/passman-recovery && cargo +nightly fuzz run recovery_import fuzz/corpus/recovery_import -- -max_total_time=900 -rss_limit_mb=2048 -timeout=10
+        run: cd crates/passman-recovery && cargo +nightly fuzz run --target x86_64-unknown-linux-gnu recovery_import fuzz/corpus/recovery_import -- -max_total_time=900 -rss_limit_mb=2048 -timeout=10
 
   # End-to-end CLI smoke against a software TPM (the real TPM2 backend, isolated
   # in a tempdir). swtpm is a HARD requirement here: the job installs it and the
