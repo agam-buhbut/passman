@@ -239,7 +239,9 @@ pub fn argon2id_within_memory(
 
 #[cfg(test)]
 mod tests {
-    use super::{argon2id, memory_cost_fits, KdfParams, MAX_M_KIB, MAX_P, MAX_T};
+    use super::{
+        argon2id, argon2id_within_memory, memory_cost_fits, KdfParams, MAX_M_KIB, MAX_P, MAX_T,
+    };
     use crate::secret::SecretString;
 
     #[test]
@@ -334,5 +336,21 @@ mod tests {
             p: 1,
         };
         assert!(argon2id(&pw, &salt, &bad).is_err());
+    }
+
+    #[test]
+    fn argon2id_within_memory_refuses_a_cost_above_the_given_budget() {
+        let pw = SecretString::new("correct horse battery staple".to_owned());
+        let salt = [0u8; 16];
+        let params = KdfParams {
+            m_kib: 64,
+            t: 1,
+            p: 1,
+        };
+        // 64 KiB is above 80% of 64 KiB available: refused before allocating.
+        assert!(argon2id_within_memory(&pw, &salt, &params, Some(64)).is_err());
+        // 64 KiB fits exactly in 80% of 80 KiB; `None` skips the host check.
+        assert!(argon2id_within_memory(&pw, &salt, &params, Some(80)).is_ok());
+        assert!(argon2id_within_memory(&pw, &salt, &params, None).is_ok());
     }
 }
