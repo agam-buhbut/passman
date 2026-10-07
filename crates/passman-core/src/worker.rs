@@ -25,7 +25,7 @@ use crate::{
     App, Clipboard, ClipboardCookie, CoreError, EntryHandle, RevealField, UnlockError, UnlockedApp,
 };
 use passman_crypto::{KdfParams, SecretString};
-use passman_hsm::{BiometricPrompter, HardwareKeyStore};
+use passman_hsm::{BiometricPrompter, HardwareKeyStore, HsmError};
 use passman_policy::{Charset, EntryPolicy, GenerationRequest, RequiredClasses};
 use passman_recovery::RecoveryPreset;
 use passman_totp::TotpConfig;
@@ -348,6 +348,13 @@ fn create_message(e: &CoreError) -> String {
         CoreError::SoftwareHsmRefused => {
             "This device has no acceptable hardware key store.".to_owned()
         }
+        // On Android this is most often a phone with no screen lock: the
+        // secure key needs one. Say what to do instead of a bare failure.
+        CoreError::Hsm(HsmError::HardwareAbsent) => {
+            "Set a screen lock (PIN, pattern or password) on this device first. \
+             passman needs it to protect its secure key."
+                .to_owned()
+        }
         _ => "The vault could not be created.".to_owned(),
     }
 }
@@ -637,5 +644,29 @@ fn operation_message(e: &CoreError) -> String {
             "The master password is too weak for a recovery export.".to_owned()
         }
         _ => "The operation failed.".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_without_a_screen_lock_says_what_to_do() {
+        let msg = create_message(&CoreError::Hsm(HsmError::HardwareAbsent));
+        assert!(msg.contains("screen lock"), "{msg}");
+        // The Android shell rewrites messages that mention these words, which
+        // would hide the advice (MainActivity.friendlyDetail).
+        let lower = msg.to_lowercase();
+        for word in [
+            "hardware",
+            "key store",
+            "another",
+            "already",
+            "in use",
+            "try again in",
+        ] {
+            assert!(!lower.contains(word), "{word:?} in {msg}");
+        }
     }
 }
