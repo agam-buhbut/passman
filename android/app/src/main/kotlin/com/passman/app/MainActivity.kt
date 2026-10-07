@@ -444,6 +444,9 @@ private fun GateScreen(
             when {
                 mismatch -> Text("Passwords don't match.")
                 tooShort -> Text("Use at least 12 characters for your master password.")
+                // Without this the Create button stays greyed out with no reason shown.
+                master.isNotEmpty() && confirm.isEmpty() ->
+                    Text("Type the password again in the confirm box.")
                 else -> Text("No vault yet — create one.")
             }
             // B8: live strength readout. A 0 score is too weak — block create.
