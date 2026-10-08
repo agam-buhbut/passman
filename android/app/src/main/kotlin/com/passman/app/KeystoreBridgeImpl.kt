@@ -2,10 +2,12 @@ package com.passman.app
 
 import android.app.KeyguardManager
 import android.content.Context
+import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyInfo
 import android.security.keystore.KeyProperties
 import android.security.keystore.StrongBoxUnavailableException
+import android.util.Log
 import androidx.biometric.BiometricPrompt
 import androidx.fragment.app.FragmentActivity
 import java.security.KeyStore
@@ -243,7 +245,10 @@ class KeystoreBridgeImpl(
         BiometricPrompt.ERROR_HW_NOT_PRESENT,
         BiometricPrompt.ERROR_HW_UNAVAILABLE,
         -> KeystoreFailure.NoSecureLockOrHardware()
-        else -> KeystoreFailure.Backend()
+        else -> {
+            Log.w(TAG, "screen lock prompt failed: error $code")
+            KeystoreFailure.Backend()
+        }
     }
 
     /** Normalize a Java exception to a data-free [KeystoreFailure] (obligation 5). */
@@ -253,10 +258,29 @@ class KeystoreBridgeImpl(
         is javax.crypto.AEADBadTagException -> KeystoreFailure.AuthFailed()
         is javax.crypto.BadPaddingException -> KeystoreFailure.AuthFailed()
         is android.security.keystore.UserNotAuthenticatedException -> KeystoreFailure.Lockout()
-        else -> KeystoreFailure.Backend()
+        else -> {
+            // Backend() carries no detail (obligation 5), so log which error it
+            // was: the class names and Keystore's code, never the message text.
+            // A bare "could not be created" once took a debug build to explain.
+            Log.w(TAG, "key store error: ${errorTypes()}")
+            KeystoreFailure.Backend()
+        }
     }
 
+    private fun Throwable.errorTypes(): String =
+        generateSequence(this) { it.cause }.take(4).joinToString(" <- ") { t ->
+            val code = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                t is android.security.KeyStoreException
+            ) {
+                " (${t.numericErrorCode})"
+            } else {
+                ""
+            }
+            t.javaClass.name + code
+        }
+
     private companion object {
+        const val TAG = "passman"
         const val ANDROID_KEYSTORE = "AndroidKeyStore"
         const val TRANSFORMATION = "AES/GCM/NoPadding"
         const val GCM_TAG_BITS = 128

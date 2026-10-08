@@ -341,6 +341,11 @@ where
     }
 }
 
+/// The key store (Android Keystore, TPM) failed with no more specific error.
+/// Says where it failed instead of a bare "could not be created".
+const KEYSTORE_REFUSED: &str = "This device's secure storage refused to use the vault key. \
+     Please try again.";
+
 /// A user-facing message for a vault-creation failure.
 fn create_message(e: &CoreError) -> String {
     match e {
@@ -355,6 +360,7 @@ fn create_message(e: &CoreError) -> String {
              passman needs it to protect its secure key."
                 .to_owned()
         }
+        CoreError::Hsm(HsmError::Backend(_)) => KEYSTORE_REFUSED.to_owned(),
         _ => "The vault could not be created.".to_owned(),
     }
 }
@@ -630,6 +636,7 @@ fn unlock_message(e: &UnlockError) -> String {
         UnlockError::SoftwareHsmRefused => {
             "This vault uses a software backend (run with --allow-software-hsm).".to_owned()
         }
+        UnlockError::Hsm(HsmError::Backend(_)) => KEYSTORE_REFUSED.to_owned(),
         _ => "The vault could not be unlocked.".to_owned(),
     }
 }
@@ -667,6 +674,22 @@ mod tests {
             "try again in",
         ] {
             assert!(!lower.contains(word), "{word:?} in {msg}");
+        }
+    }
+
+    #[test]
+    fn a_key_store_failure_says_so_on_create_and_unlock() {
+        let backend = || HsmError::Backend("keystore error".to_owned());
+        let created = create_message(&CoreError::Hsm(backend()));
+        let unlocked = unlock_message(&UnlockError::Hsm(backend()));
+        for msg in [&created, &unlocked] {
+            assert!(msg.contains("secure storage"), "{msg}");
+            // MainActivity.friendlyDetail rewrites messages with these words
+            // into "no usable secure hardware key store", which is not this.
+            let lower = msg.to_lowercase();
+            for word in ["hardware", "key store", "try again in"] {
+                assert!(!lower.contains(word), "{word:?} in {msg}");
+            }
         }
     }
 }
