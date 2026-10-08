@@ -439,6 +439,8 @@ private fun GateScreen(
                 keyboardActions = KeyboardActions(onDone = { onUnlock(master, code) }),
             )
             Button({ onUnlock(master, code) }, Modifier.fillMaxWidth(), enabled = !inFlight) { Text("Unlock") }
+            // Unlock unwraps two keys, one screen-lock prompt each (create too).
+            Text("Unlocking asks for your screen lock twice.")
         } else {
             OutlinedTextField(
                 confirm, { confirm = it }, label = { Text("Confirm master password") },
@@ -474,6 +476,9 @@ private fun GateScreen(
                 Modifier.fillMaxWidth(),
                 enabled = !inFlight && master.length >= 12 && master == confirm && strengthScore != 0,
             ) { Text("Create vault") }
+            // Create wraps two keys and each use needs the screen lock: warn so
+            // the second prompt doesn't look like a mistake.
+            Text("Creating the vault asks for your screen lock twice.")
         }
         if (inFlight) CircularProgressIndicator()
         if (status.isNotEmpty()) Text(status)
