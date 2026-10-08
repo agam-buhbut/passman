@@ -133,10 +133,14 @@ private fun PassmanRoot(activity: FragmentActivity) {
 
     // Lock on backgrounding: ON_STOP drops the keys immediately instead of
     // waiting out the 120 s session timeout, and returns to the gate.
+    // Not during the one-time TOTP setup: the user leaves to add the key to an
+    // authenticator app or to save the backup, and locking then would throw
+    // away the only copy of the key and lock them out of the new vault. The
+    // 120 s core timeout still applies.
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_STOP) {
+            if (event == Lifecycle.Event.ON_STOP && !revealed.startsWith("otpauth://")) {
                 // Drop the keys off the main thread: never block/ANR the main
                 // thread on a PassmanApp FFI call inside a lifecycle callback.
                 // lock() is fire-and-forget on the core side; the Compose state
@@ -182,8 +186,8 @@ private fun PassmanRoot(activity: FragmentActivity) {
 
     // SAF: let the user pick where the .pmrec file goes, then write the pending
     // bytes to the returned Uri off the main thread. Opening the system picker
-    // stops this activity, so the ON_STOP observer above locks the session and
-    // returns to the gate — the write still succeeds because the bytes were
+    // stops this activity, so outside the TOTP setup the ON_STOP observer above
+    // locks the session and returns to the gate — the write still succeeds because the bytes were
     // captured before the picker launched and need no live session.
     val saveLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/octet-stream"),
