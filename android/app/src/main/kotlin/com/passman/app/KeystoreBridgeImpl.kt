@@ -63,8 +63,11 @@ class KeystoreBridgeImpl(
             generateKey(alias)
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(Cipher.ENCRYPT_MODE, secretKey(alias))
-            cipher.updateAAD(byteArrayOf(slotTag.toByte())) // obligation 1 (encrypt)
+            // The key needs auth for every use, so Keystore refuses each step of
+            // the operation, the AAD included, until the prompt has authorized
+            // this cipher. Feeding the AAD first failed every real create.
             authenticate(cipher)
+            cipher.updateAAD(byteArrayOf(slotTag.toByte())) // obligation 1 (encrypt)
             val iv = cipher.iv // obligation 3
             val ciphertext = cipher.doFinal(material)
             return WrapOutput(iv, ciphertext, securityLevelOf(alias))
@@ -85,8 +88,8 @@ class KeystoreBridgeImpl(
         try {
             val cipher = Cipher.getInstance(TRANSFORMATION)
             cipher.init(Cipher.DECRYPT_MODE, secretKey(alias), GCMParameterSpec(GCM_TAG_BITS, iv))
+            authenticate(cipher) // before the AAD: see wrap
             cipher.updateAAD(byteArrayOf(slotTag.toByte())) // obligation 1 (decrypt)
-            authenticate(cipher)
             // A wrong slot (AAD) or a tampered blob fails the GCM tag here.
             // The returned plaintext (K_hsm / TOTP seed) is the accepted,
             // unavoidable residual: it must cross the FFI back to the core, so it
