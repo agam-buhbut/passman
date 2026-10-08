@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -38,6 +39,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -525,95 +527,40 @@ private fun VaultScreen(
         }
     }
 
+    if (isProvisioningUri) {
+        // The one-time TOTP setup gets its own scrolling screen: the QR, the
+        // key, the confirm field and the backup card do not fit on a phone,
+        // and the entry list below is a LazyColumn, which cannot sit in a scroll.
+        Column(
+            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).imePadding().padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("Vault (${entries.size})", style = MaterialTheme.typography.titleLarge)
+                Button(onLock) { Text("Lock") }
+            }
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TotpSetup(revealed, inFlight, onConfirmTotp, onExportRecovery, onClearRevealed)
+                }
+            }
+            if (status.isNotEmpty()) Text(status)
+        }
+        return
+    }
+
     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             Text("Vault (${entries.size})", style = MaterialTheme.typography.titleLarge)
             Button(onLock) { Text("Lock") }
         }
-        // The onboarding card below carries its own export button while the
-        // one-time QR is shown; avoid a duplicate here in that state.
-        if (!isProvisioningUri) {
-            TextButton(onExportRecovery, enabled = !inFlight) { Text("Export recovery backup") }
-        }
+        TextButton(onExportRecovery, enabled = !inFlight) { Text("Export recovery backup") }
         if (revealed.isNotEmpty()) {
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    if (isProvisioningUri) {
-                        Text("Scan with your authenticator app (shown once):")
-                        QrCode(revealed, Modifier.size(220.dp))
-                        Text(revealed, style = MaterialTheme.typography.bodySmall)
-
-                        // B8: confirm the authenticator was provisioned before
-                        // letting the user leave this one-time screen.
-                        var totpCode by remember { mutableStateOf("") }
-                        var confirmed by remember { mutableStateOf(false) }
-                        var confirmMsg by remember { mutableStateOf("") }
-                        if (confirmed) {
-                            Text("Authenticator confirmed ✓")
-                        } else {
-                            Text("Confirm by entering the current 6-digit code:")
-                            OutlinedTextField(
-                                totpCode,
-                                { totpCode = it; confirmMsg = "" },
-                                label = { Text("TOTP code") },
-                                modifier = Modifier.fillMaxWidth(),
-                                keyboardOptions = KeyboardOptions(
-                                    keyboardType = KeyboardType.Number,
-                                    imeAction = ImeAction.Done,
-                                ),
-                                keyboardActions = KeyboardActions(onDone = {
-                                    onConfirmTotp(totpCode) { ok ->
-                                        confirmed = ok
-                                        confirmMsg = if (ok) "" else "That code didn't match — try again"
-                                    }
-                                }),
-                            )
-                            Button(
-                                {
-                                    onConfirmTotp(totpCode) { ok ->
-                                        confirmed = ok
-                                        confirmMsg = if (ok) "" else "That code didn't match — try again"
-                                    }
-                                },
-                                Modifier.fillMaxWidth(),
-                                enabled = !inFlight && totpCode.isNotEmpty(),
-                            ) { Text("Confirm") }
-                            if (confirmMsg.isNotEmpty()) Text(confirmMsg)
-                        }
-
-                        // B7 onboarding nudge: without a backup, a lost or wiped
-                        // device means a permanently lost vault.
-                        Card(Modifier.fillMaxWidth()) {
-                            Column(
-                                Modifier.padding(12.dp),
-                                verticalArrangement = Arrangement.spacedBy(6.dp),
-                            ) {
-                                Text(
-                                    "Create a recovery backup now",
-                                    style = MaterialTheme.typography.titleSmall,
-                                )
-                                Text(
-                                    "Without a backup, a lost or wiped device means a " +
-                                        "permanently lost vault.",
-                                )
-                                Button(
-                                    onExportRecovery,
-                                    Modifier.fillMaxWidth(),
-                                    enabled = !inFlight,
-                                ) { Text("Export recovery backup") }
-                            }
-                        }
-
-                        Button(
-                            onClearRevealed,
-                            Modifier.fillMaxWidth(),
-                            enabled = confirmed,
-                        ) { Text("Continue to vault") }
-                    } else {
-                        Text(if (showRevealed) revealed else "••••••••")
-                        TextButton({ showRevealed = !showRevealed }) {
-                            Text(if (showRevealed) "Hide" else "Show")
-                        }
+                    Text(if (showRevealed) revealed else "••••••••")
+                    TextButton({ showRevealed = !showRevealed }) {
+                        Text(if (showRevealed) "Hide" else "Show")
                     }
                 }
             }
@@ -644,6 +591,94 @@ private fun VaultScreen(
         if (status.isNotEmpty()) Text(status)
     }
 }
+
+/** The one-time TOTP setup: QR, typed key, confirm, backup nudge, continue. */
+@Composable
+private fun TotpSetup(
+    revealed: String,
+    inFlight: Boolean,
+    onConfirmTotp: (String, (Boolean) -> Unit) -> Unit,
+    onExportRecovery: () -> Unit,
+    onClearRevealed: () -> Unit,
+) {
+    Text("Scan with your authenticator app (shown once):")
+    QrCode(revealed, Modifier.size(220.dp))
+    // The raw otpauth:// link is long and unreadable; show just the key,
+    // in groups of four, for typing into an authenticator by hand.
+    Text("Or type this key into the app:")
+    Text(totpKeyForDisplay(revealed), fontFamily = FontFamily.Monospace)
+
+    // B8: confirm the authenticator was provisioned before
+    // letting the user leave this one-time screen.
+    var totpCode by remember { mutableStateOf("") }
+    var confirmed by remember { mutableStateOf(false) }
+    var confirmMsg by remember { mutableStateOf("") }
+    if (confirmed) {
+        Text("Authenticator confirmed ✓")
+    } else {
+        Text("Confirm by entering the current 6-digit code:")
+        OutlinedTextField(
+            totpCode,
+            { totpCode = it; confirmMsg = "" },
+            label = { Text("TOTP code") },
+            modifier = Modifier.fillMaxWidth(),
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Number,
+                imeAction = ImeAction.Done,
+            ),
+            keyboardActions = KeyboardActions(onDone = {
+                onConfirmTotp(totpCode) { ok ->
+                    confirmed = ok
+                    confirmMsg = if (ok) "" else "That code didn't match — try again"
+                }
+            }),
+        )
+        Button(
+            {
+                onConfirmTotp(totpCode) { ok ->
+                    confirmed = ok
+                    confirmMsg = if (ok) "" else "That code didn't match — try again"
+                }
+            },
+            Modifier.fillMaxWidth(),
+            enabled = !inFlight && totpCode.isNotEmpty(),
+        ) { Text("Confirm") }
+        if (confirmMsg.isNotEmpty()) Text(confirmMsg)
+    }
+
+    // B7 onboarding nudge: without a backup, a lost or wiped
+    // device means a permanently lost vault.
+    Card(Modifier.fillMaxWidth()) {
+        Column(
+            Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                "Create a recovery backup now",
+                style = MaterialTheme.typography.titleSmall,
+            )
+            Text(
+                "Without a backup, a lost or wiped device means a " +
+                    "permanently lost vault.",
+            )
+            Button(
+                onExportRecovery,
+                Modifier.fillMaxWidth(),
+                enabled = !inFlight,
+            ) { Text("Export recovery backup") }
+        }
+    }
+
+    Button(
+        onClearRevealed,
+        Modifier.fillMaxWidth(),
+        enabled = confirmed,
+    ) { Text("Continue to vault") }
+}
+
+/** The base32 key from an otpauth:// link, in groups of four. */
+internal fun totpKeyForDisplay(uri: String): String =
+    uri.substringAfter("secret=", "").substringBefore('&').chunked(4).joinToString(" ")
 
 /**
  * B7 credential collection for a recovery export. Gathers the master password, a
