@@ -6,7 +6,6 @@ import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyInfo
 import android.security.keystore.KeyProperties
-import android.security.keystore.StrongBoxUnavailableException
 import android.util.Log
 import androidx.biometric.BiometricPrompt
 import androidx.fragment.app.FragmentActivity
@@ -141,10 +140,18 @@ class KeystoreBridgeImpl(
                 KeyProperties.AUTH_BIOMETRIC_STRONG or KeyProperties.AUTH_DEVICE_CREDENTIAL,
             )
         }
-        // Prefer StrongBox; fall back to TEE if the secure element is unavailable.
+        // Prefer StrongBox; fall back to the TEE on ANY StrongBox refusal. Phones
+        // refuse in more ways than StrongBoxUnavailableException (ProviderException,
+        // KeyStoreException, ...), and letting those through failed probe(), so the
+        // core took a phone with good hardware for software-only. A TEE failure
+        // still throws as before, and securityLevelOf reports the level we really got.
         try {
             generateWith(builder.setIsStrongBoxBacked(true).build())
-        } catch (_: StrongBoxUnavailableException) {
+        } catch (e: Exception) {
+            Log.w(TAG, "StrongBox refused the key, using the TEE: ${e.errorTypes()}")
+            // Best effort: drop anything half made under this alias. The TEE key
+            // below replaces it anyway, so a failed delete changes nothing.
+            runCatching { keyStore.deleteEntry(alias) }
             generateWith(builder.setIsStrongBoxBacked(false).build())
         }
     }
