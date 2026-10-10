@@ -1,6 +1,7 @@
 package com.passman.app
 
 import android.app.KeyguardManager
+import android.os.SystemClock
 import androidx.fragment.app.FragmentActivity
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -22,7 +23,8 @@ import org.junit.runner.RunWith
  * The real per-use auth path, which [KeystoreBridgeInstrumentedTest] turns off:
  * every key use shows the screen-lock prompt, and this test types the PIN. With
  * auth off, feeding the AAD before the prompt went unseen and broke every real
- * create. Needs a test phone with a PIN screen lock and that PIN passed in:
+ * create. Needs a test phone with a PIN screen lock (a fingerprint as well is
+ * fine) and that PIN passed in:
  *
  *   adb shell am instrument -w -e devicePin 1234 \
  *     -e class com.passman.app.KeystoreAuthPathTest \
@@ -67,11 +69,34 @@ class KeystoreAuthPathTest {
         }
     }
 
-    /** Waits for the prompt's PIN field, types the PIN and waits for it to close. */
+    /**
+     * Waits for the prompt's PIN field, types the PIN and waits for it to close.
+     * Works with or without a fingerprint enrolled: with one, the prompt opens on
+     * the fingerprint view, so this first taps its switch-to-PIN button. That
+     * button is found by the stock Android id, or else by its text; Samsung's
+     * exact text is a best guess.
+     */
     private fun enterPin(device: UiDevice, pin: String): Boolean {
         // Stock Android and Samsung's own prompt both name the field lockPassword.
         val field = By.res(Pattern.compile(".*:id/lockPassword"))
-        device.wait(Until.findObject(field), PROMPT_WAIT_MS) ?: return false
+        val useCredential = listOf(
+            By.res(Pattern.compile(".*:id/button_use_credential")),
+            By.clickable(true)
+                .text(Pattern.compile(".*use (pin|password|pattern).*", Pattern.CASE_INSENSITIVE)),
+        )
+        val deadline = SystemClock.uptimeMillis() + PROMPT_WAIT_MS
+        while (!device.hasObject(field)) {
+            val left = deadline - SystemClock.uptimeMillis()
+            if (left <= 0) return false
+            val button = useCredential.firstNotNullOfOrNull { device.findObject(it) }
+            if (button == null) {
+                device.wait(Until.hasObject(field), minOf(left, POLL_MS))
+            } else {
+                // Tap once only, then give the PIN view the rest of the time to show.
+                button.click()
+                device.wait(Until.findObject(field), left) ?: return false
+            }
+        }
         device.executeShellCommand("input text $pin")
         device.pressEnter()
         // Wait for this prompt to close so the next wait sees the next prompt.
@@ -81,5 +106,6 @@ class KeystoreAuthPathTest {
 
     private companion object {
         const val PROMPT_WAIT_MS = 20_000L
+        const val POLL_MS = 500L
     }
 }
