@@ -145,6 +145,10 @@ cargo run -p passman-uniffi --features bindgen --bin uniffi-bindgen -- generate 
 cd android && ./gradlew :app:assembleDebug     # or: gradle :app:assembleDebug
 ```
 
+On Samsung phones, **Auto Blocker** (Settings > Security and privacy > Auto
+Blocker) blocks APKs installed from outside an app store, including through
+`adb install`. Turn it off to install a build.
+
 The phone app stores its vault in app-private storage and shows the TOTP setup
 as a **scannable QR code** on vault creation. On phones the key-derivation
 strength defaults to the **Low** preset (256 MiB Argon2id, labelled "Low
