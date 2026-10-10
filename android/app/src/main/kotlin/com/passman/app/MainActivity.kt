@@ -1,17 +1,22 @@
 package com.passman.app
 
+import android.graphics.Color
 import android.os.Bundle
 import android.view.WindowManager
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -49,8 +54,10 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import java.io.File
 import java.io.IOException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -65,9 +72,25 @@ import uniffi.passman_uniffi.estimateStrength
 /** Top-level screen state. */
 private enum class Screen { GATE, VAULT }
 
+// The pending 30 s clipboard clear. It lives with the process, not the screen:
+// copy, switch app, paste always stops (and may rebuild) this activity, and
+// that is exactly when the clear must still run. Only touched on the main
+// thread. A new copy cancels the previous one so it never wipes a newer clip.
+// ponytail: an in-process timer. If Android kills passman in the background the
+// clear never runs, and if it freezes the process the clear runs late.
+private val clipboardScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+private var clipboardClearJob: Job? = null
+
 class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Android 15+ always draws a targetSdk 35 app under the system bars;
+        // opt in on every version so all phones behave the same. The app is
+        // always light, so ask for dark bar icons over a see-through bar.
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.light(Color.TRANSPARENT, Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.light(Color.TRANSPARENT, Color.TRANSPARENT),
+        )
         // Block screenshots, screen recording, and the recents/app-switcher
         // snapshot — the revealed password and the plaintext TOTP seed are
         // on screen (threats #5/#16).
@@ -78,7 +101,11 @@ class MainActivity : FragmentActivity() {
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    PassmanRoot(activity = this)
+                    // Keep every screen clear of the status bar, camera hole,
+                    // navigation bar and keyboard, which now overlap the app.
+                    Box(Modifier.safeDrawingPadding()) {
+                        PassmanRoot(activity = this@MainActivity)
+                    }
                 }
             }
         }
@@ -89,6 +116,8 @@ class MainActivity : FragmentActivity() {
 private fun PassmanRoot(activity: FragmentActivity) {
     val scope = rememberCoroutineScope()
     val vaultFile = remember { File(activity.filesDir, "vault.pmv") }
+    // One instance: the core uses it, and the 30 s auto-clear calls its backstop.
+    val clipboard = remember { ClipboardBridgeImpl(activity.applicationContext) }
     // Defense-in-depth: never crash the whole app if opening the vault fails.
     // `open` can return AppError.Setup (e.g. the lockfile cannot be created);
     // surface it on a screen instead of letting the exception escape and kill
@@ -104,7 +133,7 @@ private fun PassmanRoot(activity: FragmentActivity) {
                 PassmanApp.open(
                     vaultFile.absolutePath,
                     KeystoreBridgeImpl(activity.applicationContext, requireAuth = true) { activity },
-                    ClipboardBridgeImpl(activity.applicationContext),
+                    clipboard,
                     factOverwrite = true,
                 )
             }
@@ -127,16 +156,14 @@ private fun PassmanRoot(activity: FragmentActivity) {
     var revealed by remember { mutableStateOf("") }
     var inFlight by remember { mutableStateOf(false) }
 
-    // The pending clipboard auto-clear; a fresh copy cancels the prior one so we
-    // never wipe a newer clip after the older clip's 30 s elapses.
-    val clearJob = remember { mutableStateOf<Job?>(null) }
-
     // Lock on backgrounding: ON_STOP drops the keys immediately instead of
     // waiting out the 120 s session timeout, and returns to the gate.
     // Not during the one-time TOTP setup: the user leaves to add the key to an
     // authenticator app or to save the backup, and locking then would throw
     // away the only copy of the key and lock them out of the new vault. The
     // 120 s core timeout still applies.
+    // A pending clipboard clear keeps running: leaving to paste the password
+    // elsewhere is the normal case it exists for.
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
@@ -146,8 +173,6 @@ private fun PassmanRoot(activity: FragmentActivity) {
                 // lock() is fire-and-forget on the core side; the Compose state
                 // resets below stay on the main thread.
                 scope.launch(Dispatchers.Default) { runCatching { app.lock() } }
-                clearJob.value?.cancel()
-                clearJob.value = null
                 entries = listOf()
                 revealed = ""
                 screen = Screen.GATE
@@ -157,7 +182,11 @@ private fun PassmanRoot(activity: FragmentActivity) {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    fun run(working: String = "Working…", block: suspend () -> Unit) = scope.launch {
+    fun run(
+        working: String = "Working…",
+        errorText: (Throwable) -> String = ::friendlyError,
+        block: suspend () -> Unit,
+    ) = scope.launch {
         inFlight = true
         status = working
         try {
@@ -173,7 +202,7 @@ private fun PassmanRoot(activity: FragmentActivity) {
             screen = Screen.GATE
             status = "Session locked — unlock again."
         } catch (t: Throwable) {
-            status = friendlyError(t)
+            status = errorText(t)
         } finally {
             inFlight = false
         }
@@ -182,6 +211,9 @@ private fun PassmanRoot(activity: FragmentActivity) {
     // B7 recovery backup. The derived bytes are recovery key material: they live
     // only between exportRecovery() returning and the SAF write, then are zeroed.
     var showExportDialog by remember { mutableStateOf(false) }
+    // The last export failure. The dialog shows it itself: the screen's status
+    // line sits behind the dialog, often under the keyboard too.
+    var exportMsg by remember { mutableStateOf("") }
     val pendingBackup = remember { mutableStateOf<ByteArray?>(null) }
 
     // SAF: let the user pick where the .pmrec file goes, then write the pending
@@ -227,6 +259,7 @@ private fun PassmanRoot(activity: FragmentActivity) {
     fun startExport(master: String, code: String, preset: RecoveryChoice) {
         scope.launch {
             inFlight = true
+            exportMsg = ""
             status = "Deriving recovery key…"
             try {
                 val bytes = withContext(Dispatchers.IO) { app.exportRecovery(master, code, preset) }
@@ -242,7 +275,9 @@ private fun PassmanRoot(activity: FragmentActivity) {
                 status = "Session locked — unlock again."
             } catch (t: Throwable) {
                 // Keep the dialog open so the user can correct the password/code.
-                status = friendlyError(t)
+                // The status line keeps the message after the dialog closes.
+                exportMsg = exportError(t, preset)
+                status = exportMsg
             } finally {
                 inFlight = false
             }
@@ -279,7 +314,10 @@ private fun PassmanRoot(activity: FragmentActivity) {
             status = status,
             inFlight = inFlight,
             onCreate = { master, kdf ->
-                run("Deriving the vault key — this is deliberately slow…") {
+                run(
+                    "Deriving the vault key — this is deliberately slow…",
+                    errorText = { createError(it, kdf) },
+                ) {
                     // KDF hardness is chosen in GateScreen and defaults to LOW
                     // (see the rationale there).
                     val uri = app.createVault(master, kdf)
@@ -307,16 +345,26 @@ private fun PassmanRoot(activity: FragmentActivity) {
                 run {
                     // Capture the cookie digest on the IO dispatcher (run{} wraps
                     // the whole block in withContext(IO)), then hop to the main
-                    // thread to touch Compose state: clearJob is a mutableStateOf,
-                    // and its cancel/reassign — plus the status write — must not run
-                    // off the main thread. scope.launch defaults to Main, so the
-                    // 30 s auto-clear job is created from the main-dispatched body.
+                    // thread: clipboardClearJob is only ever touched there, and
+                    // the status write is Compose state.
                     val digest = app.copy(item.id, FieldKind.PASSWORD)
                     withContext(Dispatchers.Main) {
-                        clearJob.value?.cancel()
-                        clearJob.value = scope.launch {
-                            delay(30_000)
+                        clipboardClearJob?.cancel()
+                        clipboardClearJob = clipboardScope.launch {
+                            // Ask the core first: while passman is in front and
+                            // unlocked it swaps the secret for a harmless fact.
+                            // Its clear does not wait for the work to finish, so
+                            // give it a moment before the backstop looks, or the
+                            // backstop could empty the clipboard first. Together
+                            // they still finish at the promised 30 s. Both run off
+                            // the main thread: clearClipboard waits for a Rust lock
+                            // that a slow call can hold.
+                            delay(28_500)
                             withContext(Dispatchers.IO) { app.clearClipboard(digest) }
+                            delay(1_500)
+                            // The backstop clears what the core could not: it was
+                            // locked, or Android would not let it read the clipboard.
+                            withContext(Dispatchers.IO) { clipboard.clearIfOursOrUnreadable(digest) }
                         }
                         status = "Copied — clears in 30 s"
                     }
@@ -327,12 +375,15 @@ private fun PassmanRoot(activity: FragmentActivity) {
             },
             onClearRevealed = { revealed = "" },
             onConfirmTotp = { code, onResult -> confirmTotp(code, onResult) },
-            onExportRecovery = { showExportDialog = true },
+            onExportRecovery = {
+                exportMsg = ""
+                showExportDialog = true
+            },
             onLock = {
                 run {
+                    // A pending clipboard clear keeps running: the core's own
+                    // wipe on lock misses a copy made before the last unlock.
                     app.lock()
-                    clearJob.value?.cancel()
-                    clearJob.value = null
                     entries = listOf()
                     revealed = ""
                     screen = Screen.GATE
@@ -344,6 +395,7 @@ private fun PassmanRoot(activity: FragmentActivity) {
     if (showExportDialog) {
         ExportRecoveryDialog(
             inFlight = inFlight,
+            error = exportMsg,
             onDismiss = { if (!inFlight) showExportDialog = false },
             onExport = { master, code, preset -> startExport(master, code, preset) },
         )
@@ -395,6 +447,43 @@ private fun friendlyDetail(detail: String): String {
     }
 }
 
+/**
+ * [friendlyError] for a recovery export. The core sends the same bare line,
+ * "The operation failed.", for a wrong master password or TOTP code, a
+ * cancelled screen-lock prompt, and a backup size that does not fit in this
+ * phone's free memory (it refuses Argon2 above 80% of free memory). We cannot
+ * tell them apart, so name the likely fixes. Not in [friendlyDetail]: other
+ * actions send that line for other reasons.
+ */
+private fun exportError(t: Throwable, preset: RecoveryChoice): String =
+    if (t is AppException.Failed && t.detail == "The operation failed.") {
+        // 1 GB is the smallest size, so only offer a smaller one above it.
+        val smaller = if (preset == RecoveryChoice.FLOOR) "" else ", or pick a smaller backup size"
+        "Couldn't make the backup. Check the master password and TOTP code. " +
+            "If both are right, this phone may not have enough free memory: " +
+            "close other apps and try again$smaller."
+    } else {
+        friendlyError(t)
+    }
+
+/**
+ * [friendlyError] for create. Medium needs about 1.3 GB of free memory (the
+ * core refuses Argon2 above 80% of free memory), and when it does not fit the
+ * core sends only its bare "could not be created" line, after both screen-lock
+ * prompts. A cancelled prompt sends the same line, so name both fixes. Low
+ * keeps the plain line: it needs far less, and there is no smaller choice.
+ */
+private fun createError(t: Throwable, kdf: KdfChoice): String =
+    if (kdf == KdfChoice.MEDIUM && t is AppException.Failed &&
+        t.detail == "The vault could not be created."
+    ) {
+        "Couldn't create the vault. If you cancelled the screen lock, try again. " +
+            "Otherwise this phone may not have enough free memory for Medium: " +
+            "close other apps and try again, or choose Low."
+    } else {
+        friendlyError(t)
+    }
+
 @Composable
 private fun GateScreen(
     vaultExists: Boolean,
@@ -422,11 +511,17 @@ private fun GateScreen(
         strengthScore = withContext(Dispatchers.Default) { estimateStrength(master).toInt() }
     }
 
-    Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    // Scrolls so the keyboard cannot hide the Create/Unlock button.
+    Column(
+        Modifier.verticalScroll(rememberScrollState()).padding(24.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
         Text("passman", style = MaterialTheme.typography.headlineMedium)
+        // The Password keyboard type stops predictive text from learning it.
         OutlinedTextField(
             master, { master = it }, label = { Text("Master password") },
             visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
         )
         if (vaultExists) {
             OutlinedTextField(
@@ -445,6 +540,7 @@ private fun GateScreen(
             OutlinedTextField(
                 confirm, { confirm = it }, label = { Text("Confirm master password") },
                 visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
             )
             // Local guards: the two fields must match and we require 12+ chars.
             val mismatch = confirm.isNotEmpty() && master != confirm
@@ -539,9 +635,9 @@ private fun VaultScreen(
     if (isProvisioningUri) {
         // The one-time TOTP setup gets its own scrolling screen: the QR, the
         // key, the confirm field and the backup card do not fit on a phone,
-        // and the entry list below is a LazyColumn, which cannot sit in a scroll.
+        // and the vault screen below is a LazyColumn, which cannot sit in a scroll.
         Column(
-            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).imePadding().padding(16.dp),
+            Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -558,46 +654,70 @@ private fun VaultScreen(
         return
     }
 
-    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Text("Vault (${entries.size})", style = MaterialTheme.typography.titleLarge)
-            Button(onLock) { Text("Lock") }
-        }
-        TextButton(onExportRecovery, enabled = !inFlight) { Text("Export recovery backup") }
-        if (revealed.isNotEmpty()) {
-            Card(Modifier.fillMaxWidth()) {
-                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(if (showRevealed) revealed else "••••••••")
-                    TextButton({ showRevealed = !showRevealed }) {
-                        Text(if (showRevealed) "Hide" else "Show")
-                    }
-                }
+    // One list that scrolls as a whole, so every row stays reachable at any
+    // window height: landscape, split screen, or with the keyboard open. A
+    // list with a fixed form under it gave one of the two no room there.
+    // The keys keep a focused field when rows above it come and go (the
+    // revealed card hides itself after 10 s).
+    LazyColumn(
+        Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        item(key = "header") {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("Vault (${entries.size})", style = MaterialTheme.typography.titleLarge)
+                Button(onLock) { Text("Lock") }
             }
         }
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
-            items(entries) { item ->
+        item(key = "export") {
+            TextButton(onExportRecovery, enabled = !inFlight) { Text("Export recovery backup") }
+        }
+        if (revealed.isNotEmpty()) {
+            item(key = "revealed") {
                 Card(Modifier.fillMaxWidth()) {
-                    Row(Modifier.padding(12.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Text(item.label)
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            Button({ onReveal(item) }, enabled = !inFlight) { Text("Reveal") }
-                            Button({ onCopy(item) }, enabled = !inFlight) { Text("Copy") }
+                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(if (showRevealed) revealed else "••••••••")
+                        TextButton({ showRevealed = !showRevealed }) {
+                            Text(if (showRevealed) "Hide" else "Show")
                         }
                     }
                 }
             }
         }
-        Text("Add entry", style = MaterialTheme.typography.titleMedium)
-        OutlinedTextField(label, { label = it }, label = { Text("Label") }, modifier = Modifier.fillMaxWidth())
-        OutlinedTextField(user, { user = it }, label = { Text("Username") }, modifier = Modifier.fillMaxWidth())
-        OutlinedTextField(pass, { pass = it }, label = { Text("Password") }, modifier = Modifier.fillMaxWidth())
-        Button(
-            { onAdd(label, user, pass); label = ""; user = ""; pass = "" },
-            Modifier.fillMaxWidth(),
-            enabled = !inFlight,
-        ) { Text("Add") }
-        if (inFlight) CircularProgressIndicator()
-        if (status.isNotEmpty()) Text(status)
+        items(entries) { item ->
+            Card(Modifier.fillMaxWidth()) {
+                Row(Modifier.padding(12.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text(item.label)
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Button({ onReveal(item) }, enabled = !inFlight) { Text("Reveal") }
+                        Button({ onCopy(item) }, enabled = !inFlight) { Text("Copy") }
+                    }
+                }
+            }
+        }
+        item(key = "add-title") { Text("Add entry", style = MaterialTheme.typography.titleMedium) }
+        item(key = "add-label") {
+            OutlinedTextField(label, { label = it }, label = { Text("Label") }, modifier = Modifier.fillMaxWidth())
+        }
+        item(key = "add-user") {
+            OutlinedTextField(user, { user = it }, label = { Text("Username") }, modifier = Modifier.fillMaxWidth())
+        }
+        item(key = "add-pass") {
+            OutlinedTextField(
+                pass, { pass = it }, label = { Text("Password") }, modifier = Modifier.fillMaxWidth(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+            )
+        }
+        item(key = "add-button") {
+            Button(
+                { onAdd(label, user, pass); label = ""; user = ""; pass = "" },
+                Modifier.fillMaxWidth(),
+                enabled = !inFlight,
+            ) { Text("Add") }
+        }
+        if (inFlight) item(key = "spinner") { CircularProgressIndicator() }
+        if (status.isNotEmpty()) item(key = "status") { Text(status) }
     }
 }
 
@@ -694,10 +814,12 @@ internal fun totpKeyForDisplay(uri: String): String =
  * fresh TOTP code, and an Argon2id cost preset, then hands them to [onExport].
  * The caller dismisses the dialog once the (slow) derivation starts, so the
  * master password is not retained in TextField state beyond the call.
+ * [error] is the last failure, shown here because the screen behind is hidden.
  */
 @Composable
 private fun ExportRecoveryDialog(
     inFlight: Boolean,
+    error: String,
     onDismiss: () -> Unit,
     onExport: (String, String, RecoveryChoice) -> Unit,
 ) {
@@ -729,6 +851,7 @@ private fun ExportRecoveryDialog(
                     label = { Text("Master password") },
                     visualTransformation = PasswordVisualTransformation(),
                     modifier = Modifier.fillMaxWidth(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                 )
                 OutlinedTextField(
                     code,
@@ -738,25 +861,29 @@ private fun ExportRecoveryDialog(
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                 )
                 Text("Backup strength", style = MaterialTheme.typography.labelLarge)
-                // Stacked: each label says how much free memory a restore needs
-                // (the file's Argon2 memory plus 20% headroom).
+                // Stacked: each label says how much free memory it needs. Making
+                // the backup runs Argon2 at this size on this phone, and so does
+                // a restore; the core refuses either above 80% of free memory,
+                // so that is the size plus a quarter.
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     KdfOption(
-                        "1 GB — fits most phones (default)",
+                        "1 GB — needs about 1.3 GB free memory to make and to restore (default)",
                         preset == RecoveryChoice.FLOOR,
                     ) { preset = RecoveryChoice.FLOOR }
                     KdfOption(
-                        "4 GB — restore needs about 5 GB free memory",
+                        "4 GB — needs about 5 GB free memory to make and to restore",
                         preset == RecoveryChoice.DEFAULT,
                     ) { preset = RecoveryChoice.DEFAULT }
                     KdfOption(
-                        "8 GB — restore needs about 10 GB free memory",
+                        "8 GB — needs about 10 GB free memory to make and to restore",
                         preset == RecoveryChoice.PARANOID,
                     ) { preset = RecoveryChoice.PARANOID }
                 }
                 if (inFlight) {
                     CircularProgressIndicator()
                     Text("Deriving recovery key…")
+                } else if (error.isNotEmpty()) {
+                    Text(error, color = MaterialTheme.colorScheme.error)
                 }
             }
         },

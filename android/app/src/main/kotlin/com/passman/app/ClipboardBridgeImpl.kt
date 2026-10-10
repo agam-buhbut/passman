@@ -54,6 +54,27 @@ class ClipboardBridgeImpl(private val context: Context) : ClipboardBridge {
             .setPrimaryClip(ClipData.newPlainText("passman", text))
     }
 
+    /**
+     * The shell's backstop for the 30 s auto-clear. Not part of [ClipboardBridge]:
+     * the core never calls it. The caller asks the core to clear first and waits
+     * a moment before calling this: the core's clear returns before the work is
+     * done, and running both at once could empty the clipboard before the core
+     * swaps in its fact.
+     *
+     * The core often cannot clear: Android 10+ refuses clipboard reads to an
+     * app that is not in front, so the core sees an empty clipboard, and once
+     * the session is locked the core ignores the request. So clear here when
+     * the clipboard still holds the copied secret ([digest]), or when Android
+     * will not let us look. That blind clear also wipes anything copied
+     * elsewhere since; the user accepted that. Clearing needs no focus.
+     */
+    fun clearIfOursOrUnreadable(digest: ByteArray) {
+        val current = readDigest()
+        if (current == null || MessageDigest.isEqual(current, digest)) {
+            manager?.clearPrimaryClip()
+        }
+    }
+
     private fun sha256(value: String): ByteArray =
         MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8))
 }
